@@ -1,6 +1,6 @@
 # OPENCV_table_extraction
 
-def process_table(img, table_box, page_num, table_num):
+    process_table(img, table_box, page_num, table_num):
     """
     Crops each cell from a table using a robust method that reconstructs the
     grid from line intersections, correctly handling merged and irregular cells.
