@@ -1,148 +1,92 @@
-# =============================================================================
-# ADD/UPDATE THESE FUNCTIONS IN SECTION 2
-# =============================================================================
-
-def detect_and_crop_grid(image, target_size=(2480, 3508)):
-    """
-    New Function: Detects if a large grid/table exists and crops to it.
-    """
-    h, w = image.shape[:2]
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def run_stage_2_extraction():
+    """Converts PNG -> Dynamic Cell Crops -> Excel Report."""
+    print("\n--- STAGE 2: Extraction (PNG to Data) ---")
+    os.makedirs(FINAL_OUTPUT_FOLDER, exist_ok=True)
     
-    # Binary Threshold
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # 1. Detect Horizontal Lines
-    hor_kernel_len = np.array(image).shape[1] // 40
-    hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hor_kernel_len, 1))
-    img_hor = cv2.erode(thresh, hor_kernel, iterations=1)
-    img_hor = cv2.dilate(img_hor, hor_kernel, iterations=1)
-
-    # 2. Detect Vertical Lines
-    ver_kernel_len = np.array(image).shape[0] // 40
-    ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ver_kernel_len))
-    img_ver = cv2.erode(thresh, ver_kernel, iterations=1)
-    img_ver = cv2.dilate(img_ver, ver_kernel, iterations=1)
-
-    # 3. Combine to find the Grid Structure
-    grid_mask = cv2.addWeighted(img_hor, 0.5, img_ver, 0.5, 0.0)
-    _, grid_mask = cv2.threshold(grid_mask, 0, 255, cv2.THRESH_BINARY)
-    
-    # 4. Find Contours
-    cnts, _ = cv2.findContours(grid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if cnts:
-        largest_cnt = max(cnts, key=cv2.contourArea)
-        x, y, cw, ch = cv2.boundingRect(largest_cnt)
-        
-        # Validation: Grid must be > 10% of image
-        if (cw * ch) > (0.1 * w * h):
-            pad = 15
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(w, x + cw + pad)
-            y2 = min(h, y + ch + pad)
-            
-            cropped = image[y1:y2, x1:x2]
-            return True, cv2.resize(cropped, target_size, interpolation=cv2.INTER_AREA)
-    
-    return False, None
-
-def find_anchors_and_crop(image, target_size=(2480, 3508)):
-    """
-    Updated Function: Crops based on Top-Left Object and Bottom-Right Object.
-    (Replaces the old QR-specific logic)
-    """
-    h, w = image.shape[:2]
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
-    
-    # Connect elements
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
-    dilated = cv2.dilate(thresh, kernel, iterations=2)
-    
-    cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not cnts:
-        return cv2.resize(image, target_size)
-
-    # 1. Find Top-Left Anchor (Smallest x + y)
-    # Only look in top-left quadrant
-    tl_candidates = [c for c in cnts if cv2.boundingRect(c)[0] < w//2 and cv2.boundingRect(c)[1] < h//2]
-    if tl_candidates:
-        tl_cnt = min(tl_candidates, key=lambda c: cv2.boundingRect(c)[0] + cv2.boundingRect(c)[1])
-        x1, y1, _, _ = cv2.boundingRect(tl_cnt)
-    else:
-        x1, y1 = 0, 0
-
-    # 2. Find Bottom-Right Anchor (Largest x + y + w + h)
-    # Only look in bottom-right quadrant
-    br_candidates = [c for c in cnts if cv2.boundingRect(c)[0] > w//3 and cv2.boundingRect(c)[1] > h//3]
-    if br_candidates:
-        br_cnt = max(br_candidates, key=lambda c: cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] + cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3])
-        bx, by, bw, bh = cv2.boundingRect(br_cnt)
-        x2, y2 = bx + bw, by + bh
-    else:
-        x2, y2 = w, h
-
-    # 3. Crop
-    pad = 20
-    final_x1 = max(0, x1 - pad)
-    final_y1 = max(0, y1 - pad)
-    final_x2 = min(w, x2 + pad)
-    final_y2 = min(h, y2 + pad)
-    
-    if final_x2 > final_x1 and final_y2 > final_y1:
-        cropped = image[final_y1:final_y2, final_x1:final_x2]
-        return cv2.resize(cropped, target_size, interpolation=cv2.INTER_AREA)
-    
-    return cv2.resize(image, target_size)
-
-
-# =============================================================================
-# UPDATE THIS FUNCTION IN SECTION 4
-# =============================================================================
-
-def run_stage_1_preprocessing():
-    """Converts TIFF -> Deskewed -> Grid/Anchor Crop -> PNG."""
-    print("\n--- STAGE 1: Pre-processing (TIFF to PNG) ---")
-    os.makedirs(INTERMEDIATE_PNG_FOLDER, exist_ok=True)
-    
-    files = glob.glob(os.path.join(INPUT_TIFF_FOLDER, '*.tif*')) + \
-            glob.glob(os.path.join(INPUT_TIFF_FOLDER, '*.TIF*'))
-    
+    files = glob.glob(os.path.join(INTERMEDIATE_PNG_FOLDER, '*.png'))
     if not files:
-        print("No TIFF files found.")
+        print("No PNG files found to extract.")
         return
 
+    all_data = []
+    
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath)
         base_name = os.path.splitext(fname)[0]
-        print(f"Processing {i+1}/{len(files)}: {fname}")
+        print(f"Extracting {i+1}/{len(files)}: {fname}")
         
-        img = cv2.imread(fpath)
-        if img is None: continue
+        full_img = cv2.imread(fpath)
+        if full_img is None: continue
+        
+        # Get dimensions for "bottom right most end" logic
+        h, w = full_img.shape[:2]
             
-        # 1. Deskew
-        deskewed = deskew_single_image(img)
+        # Setup subfolder
+        subfolder = os.path.join(FINAL_OUTPUT_FOLDER, base_name)
+        os.makedirs(subfolder, exist_ok=True)
         
-        # 2. Check for Grid
-        is_grid, grid_cropped = detect_and_crop_grid(deskewed)
+        row_data = {'Filename': fname}
         
-        final_img = None
-        prefix = ""
+        # =========================================================
+        # DYNAMIC COORDINATE LOGIC
+        # =========================================================
         
+        # Check if file is Grid or NGrid
+        is_grid = fname.startswith("Grid_")
+        
+        # --- Define Region 1 (Bottom Area) ---
+        # Logic: Start at 21, 3111 and go to the absolute bottom-right (w, h)
+        # "if non grid same" -> implies logic applies to both
+        r1_coords = (21, 3111, w, h)
+        
+        # --- Define Region 2 (Specific Block) ---
         if is_grid:
-            print("   -> Type: GRID Detected")
-            prefix = "Grid_"
-            final_img = grid_cropped
+            # Grid Coordinates
+            r2_coords = (1927, 2111, 2415, 3051)
         else:
-            print("   -> Type: NO GRID (Using Anchor crop)")
-            prefix = "NGrid_"
-            final_img = find_anchors_and_crop(deskewed)
+            # Non-Grid Coordinates
+            r2_coords = (1971, 2261, 2455, 3000)
+
+        # Pack into a temporary config list for processing
+        current_file_config = {
+            'Region_1': {'coords': r1_coords, 'method': 'default'},
+            'Region_2': {'coords': r2_coords, 'method': 'default'}
+        }
         
-        # 3. Save
-        save_name = f"{prefix}{base_name}.png"
-        cv2.imwrite(os.path.join(INTERMEDIATE_PNG_FOLDER, save_name), final_img)
-
-
+        # =========================================================
+        # PROCESSING LOOP
+        # =========================================================
+        for key, conf in current_file_config.items():
+            x1, y1, x2, y2 = conf['coords']
+            method = conf['method']
+            
+            # Safety Bounds: Ensure we don't crop outside the image
+            # "pixels will be out of range... avoid them and get end most point"
+            safe_x1 = max(0, x1)
+            safe_y1 = max(0, y1)
+            safe_x2 = min(w, x2)
+            safe_y2 = min(h, y2)
+            
+            # Sanity Check: valid crop area
+            if safe_x2 > safe_x1 and safe_y2 > safe_y1:
+                crop = full_img[safe_y1:safe_y2, safe_x1:safe_x2]
+                
+                # Save Crop
+                cv2.imwrite(os.path.join(subfolder, f"{key}.png"), crop)
+                
+                # Extract
+                text = extract_data_from_cell(crop, method)
+                row_data[key] = text
+            else:
+                print(f"   -> Warning: Invalid coords for {key} in {fname}")
+                row_data[key] = "ERROR_COORDS"
+            
+        all_data.append(row_data)
+        
+    # Save Excel
+    if all_data:
+        df = pd.DataFrame(all_data)
+        out_path = os.path.join(FINAL_OUTPUT_FOLDER, 'Final_Report.xlsx')
+        df.to_excel(out_path, index=False)
+        print(f"\nSUCCESS! Report saved to: {out_path}")
+        print(df.head())
