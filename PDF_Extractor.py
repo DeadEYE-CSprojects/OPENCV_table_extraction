@@ -1,142 +1,110 @@
-import cv2
-import numpy as np
-import os
-import glob
-import pandas as pd
-import pytesseract
-from scipy.ndimage import rotate
-import matplotlib.pyplot as plt
-
 # =============================================================================
-# 1. USER CONFIGURATION (EDIT THIS SECTION)
+# ADD/UPDATE THESE FUNCTIONS IN SECTION 2
 # =============================================================================
 
-# --- A. PATHS ---
-INPUT_TIFF_FOLDER = 'raw_tiff_images'        # Folder with your source TIFFs
-INTERMEDIATE_PNG_FOLDER = 'processed_pngs'   # Folder to save deskewed/cropped PNGs
-FINAL_OUTPUT_FOLDER = 'final_data'           # Folder for cell crops and Excel report
-
-# --- B. TESSERACT PATH (Required for Windows) ---
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# --- C. CELL COORDINATES (Now just 2 Regions) ---
-# ❗ ACTION REQUIRED: Update these (x1, y1, x2, y2) coordinates based on your PNGs.
-CELL_CONFIG = {
-    'Region_1': {
-        'coords': (100, 100, 500, 300),  # (x1, y1, x2, y2)
-        'method': 'default'              # Options: 'default', 'digits_only', 'signature_check'
-    },
-    'Region_2': {
-        'coords': (100, 500, 900, 800),  # (x1, y1, x2, y2)
-        'method': 'default'
-    }
-}
-
-# =============================================================================
-# 2. HELPER FUNCTIONS: IMAGE PROCESSING
-# =============================================================================
-
-def deskew_single_image(image):
-    """Deskews an image using projection profiles."""
-    if image is None: return None
+def detect_and_crop_grid(image, target_size=(2480, 3508)):
+    """
+    New Function: Detects if a large grid/table exists and crops to it.
+    """
     h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Downscale for speed
-    scale = 800 / max(h, w)
-    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    # Binary Threshold
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 1. Detect Horizontal Lines
+    hor_kernel_len = np.array(image).shape[1] // 40
+    hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hor_kernel_len, 1))
+    img_hor = cv2.erode(thresh, hor_kernel, iterations=1)
+    img_hor = cv2.dilate(img_hor, hor_kernel, iterations=1)
+
+    # 2. Detect Vertical Lines
+    ver_kernel_len = np.array(image).shape[0] // 40
+    ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ver_kernel_len))
+    img_ver = cv2.erode(thresh, ver_kernel, iterations=1)
+    img_ver = cv2.dilate(img_ver, ver_kernel, iterations=1)
+
+    # 3. Combine to find the Grid Structure
+    grid_mask = cv2.addWeighted(img_hor, 0.5, img_ver, 0.5, 0.0)
+    _, grid_mask = cv2.threshold(grid_mask, 0, 255, cv2.THRESH_BINARY)
     
-    scores = []
-    angles = np.arange(-5, 5.1, 0.1)
+    # 4. Find Contours
+    cnts, _ = cv2.findContours(grid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if cnts:
+        largest_cnt = max(cnts, key=cv2.contourArea)
+        x, y, cw, ch = cv2.boundingRect(largest_cnt)
+        
+        # Validation: Grid must be > 10% of image
+        if (cw * ch) > (0.1 * w * h):
+            pad = 15
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w, x + cw + pad)
+            y2 = min(h, y + ch + pad)
+            
+            cropped = image[y1:y2, x1:x2]
+            return True, cv2.resize(cropped, target_size, interpolation=cv2.INTER_AREA)
     
-    for angle in angles:
-        rotated = rotate(thresh, angle, reshape=False, order=0)
-        score = np.var(np.sum(rotated, axis=1))
-        scores.append(score)
-    
-    best_angle = angles[np.argmax(scores)]
-    
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
-    return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, 
-                          borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    return False, None
 
 def find_anchors_and_crop(image, target_size=(2480, 3508)):
-    """Crops image based on Top-Left QR and Bottom-Right Text."""
+    """
+    Updated Function: Crops based on Top-Left Object and Bottom-Right Object.
+    (Replaces the old QR-specific logic)
+    """
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
     
-    # 1. Top-Left Anchor (QR)
-    tl_search = thresh[0:h//3, 0:w//2] 
-    qr_detector = cv2.QRCodeDetector()
-    retval, _, points, _ = qr_detector.detectAndDecodeMulti(tl_search)
+    # Connect elements
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
+    dilated = cv2.dilate(thresh, kernel, iterations=2)
     
-    x1, y1 = 0, 0
-    if retval:
-        x1 = int(np.min(points[0][:, 0]))
-        y1 = int(np.min(points[0][:, 1]))
-    else:
-        cnts, _ = cv2.findContours(tl_search, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cnts:
-            largest = max(cnts, key=cv2.contourArea)
-            bx, by, _, _ = cv2.boundingRect(largest)
-            x1, y1 = bx, by
-
-    # 2. Bottom-Right Anchor (Text)
-    br_search = thresh[2*h//3:h, w//2:w]
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    dilated = cv2.dilate(br_search, kernel, iterations=2)
     cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    x2, y2 = w, h
-    if cnts:
-        best_cnt = max(cnts, key=lambda c: cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3])
-        bx, by, bw, bh = cv2.boundingRect(best_cnt)
-        x2 = bx + bw + (w // 2)
-        y2 = by + bh + (2 * h // 3)
+    if not cnts:
+        return cv2.resize(image, target_size)
 
-    # 3. Crop & Resize
+    # 1. Find Top-Left Anchor (Smallest x + y)
+    # Only look in top-left quadrant
+    tl_candidates = [c for c in cnts if cv2.boundingRect(c)[0] < w//2 and cv2.boundingRect(c)[1] < h//2]
+    if tl_candidates:
+        tl_cnt = min(tl_candidates, key=lambda c: cv2.boundingRect(c)[0] + cv2.boundingRect(c)[1])
+        x1, y1, _, _ = cv2.boundingRect(tl_cnt)
+    else:
+        x1, y1 = 0, 0
+
+    # 2. Find Bottom-Right Anchor (Largest x + y + w + h)
+    # Only look in bottom-right quadrant
+    br_candidates = [c for c in cnts if cv2.boundingRect(c)[0] > w//3 and cv2.boundingRect(c)[1] > h//3]
+    if br_candidates:
+        br_cnt = max(br_candidates, key=lambda c: cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] + cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3])
+        bx, by, bw, bh = cv2.boundingRect(br_cnt)
+        x2, y2 = bx + bw, by + bh
+    else:
+        x2, y2 = w, h
+
+    # 3. Crop
     pad = 20
-    cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
-    cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+    final_x1 = max(0, x1 - pad)
+    final_y1 = max(0, y1 - pad)
+    final_x2 = min(w, x2 + pad)
+    final_y2 = min(h, y2 + pad)
     
-    if cx2 > cx1 and cy2 > cy1:
-        cropped = image[cy1:cy2, cx1:cx2]
+    if final_x2 > final_x1 and final_y2 > final_y1:
+        cropped = image[final_y1:final_y2, final_x1:final_x2]
         return cv2.resize(cropped, target_size, interpolation=cv2.INTER_AREA)
     
     return cv2.resize(image, target_size)
 
-# =============================================================================
-# 3. HELPER FUNCTIONS: OCR EXTRACTION
-# =============================================================================
-
-def extract_data_from_cell(crop_img, method):
-    """Applies specific OCR logic based on the method tag."""
-    rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-    
-    if method == 'default':
-        return pytesseract.image_to_string(rgb).strip()
-    
-    elif method == 'digits_only':
-        # Allowed: Digits and decimal points
-        config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.'
-        return pytesseract.image_to_string(rgb, config=config).strip()
-    
-    elif method == 'signature_check':
-        gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-        _, bin_img = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-        return "SIGNED" if cv2.countNonZero(bin_img) > 500 else "NOT SIGNED"
-    
-    return ""
 
 # =============================================================================
-# 4. PIPELINE STAGES
+# UPDATE THIS FUNCTION IN SECTION 4
 # =============================================================================
 
 def run_stage_1_preprocessing():
-    """Converts TIFF -> Deskewed/Cropped PNG."""
+    """Converts TIFF -> Deskewed -> Grid/Anchor Crop -> PNG."""
     print("\n--- STAGE 1: Pre-processing (TIFF to PNG) ---")
     os.makedirs(INTERMEDIATE_PNG_FOLDER, exist_ok=True)
     
@@ -149,83 +117,32 @@ def run_stage_1_preprocessing():
 
     for i, fpath in enumerate(files):
         fname = os.path.basename(fpath)
+        base_name = os.path.splitext(fname)[0]
         print(f"Processing {i+1}/{len(files)}: {fname}")
         
-        img = cv2.imread(fpath) # Reads page 1 by default
+        img = cv2.imread(fpath)
         if img is None: continue
             
+        # 1. Deskew
         deskewed = deskew_single_image(img)
-        final_img = find_anchors_and_crop(deskewed)
         
-        save_name = os.path.splitext(fname)[0] + ".png"
+        # 2. Check for Grid
+        is_grid, grid_cropped = detect_and_crop_grid(deskewed)
+        
+        final_img = None
+        prefix = ""
+        
+        if is_grid:
+            print("   -> Type: GRID Detected")
+            prefix = "Grid_"
+            final_img = grid_cropped
+        else:
+            print("   -> Type: NO GRID (Using Anchor crop)")
+            prefix = "NGrid_"
+            final_img = find_anchors_and_crop(deskewed)
+        
+        # 3. Save
+        save_name = f"{prefix}{base_name}.png"
         cv2.imwrite(os.path.join(INTERMEDIATE_PNG_FOLDER, save_name), final_img)
 
-def run_stage_2_extraction():
-    """Converts PNG -> 2 Cell Crops -> Excel Report."""
-    print("\n--- STAGE 2: Extraction (PNG to Data) ---")
-    os.makedirs(FINAL_OUTPUT_FOLDER, exist_ok=True)
-    
-    files = glob.glob(os.path.join(INTERMEDIATE_PNG_FOLDER, '*.png'))
-    if not files:
-        print("No PNG files found to extract.")
-        return
 
-    all_data = []
-    
-    for i, fpath in enumerate(files):
-        fname = os.path.basename(fpath)
-        base_name = os.path.splitext(fname)[0]
-        print(f"Extracting {i+1}/{len(files)}: {fname}")
-        
-        full_img = cv2.imread(fpath)
-        if full_img is None: continue
-            
-        # Setup subfolder for cell images
-        subfolder = os.path.join(FINAL_OUTPUT_FOLDER, base_name)
-        os.makedirs(subfolder, exist_ok=True)
-        
-        row_data = {'Filename': fname}
-        
-        # Loop through the 2 Configured Regions
-        for key, conf in CELL_CONFIG.items():
-            x1, y1, x2, y2 = conf['coords']
-            method = conf['method']
-            
-            # Safety crop
-            h, w = full_img.shape[:2]
-            crop = full_img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-            
-            # Save Crop
-            cv2.imwrite(os.path.join(subfolder, f"{key}.png"), crop)
-            
-            # Extract
-            text = extract_data_from_cell(crop, method)
-            row_data[key] = text
-            
-        all_data.append(row_data)
-        
-    # Save Excel
-    if all_data:
-        df = pd.DataFrame(all_data)
-        out_path = os.path.join(FINAL_OUTPUT_FOLDER, 'Final_Report.xlsx')
-        df.to_excel(out_path, index=False)
-        print(f"\nSUCCESS! Report saved to: {out_path}")
-        print(df.head())
-
-# =============================================================================
-# 5. MAIN EXECUTION
-# =============================================================================
-
-def main():
-    print("=== STARTING AUTOMATED PIPELINE (2-REGION CROP) ===")
-    
-    # 1. Run TIFF -> PNG
-    run_stage_1_preprocessing()
-    
-    # 2. Run PNG -> 2 Crops -> Data
-    run_stage_2_extraction()
-    
-    print("\n=== PIPELINE COMPLETE ===")
-
-if __name__ == "__main__":
-    main()
