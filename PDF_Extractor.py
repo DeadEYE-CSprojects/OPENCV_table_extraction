@@ -17,21 +17,19 @@ INTERMEDIATE_PNG_FOLDER = 'processed_pngs'   # Folder to save deskewed/cropped P
 FINAL_OUTPUT_FOLDER = 'final_data'           # Folder for cell crops and Excel report
 
 # --- B. TESSERACT PATH (Required for Windows) ---
-# If you are on Windows, uncomment and set the path to tesseract.exe
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# --- C. CELL COORDINATES (For the 8 Crops) ---
-# Find these coordinates (x1, y1, x2, y2) using the 'processed_pngs' images.
-# Methods: 'default', 'digits_only', 'signature_check'
+# --- C. CELL COORDINATES (Now just 2 Regions) ---
+# ❗ ACTION REQUIRED: Update these (x1, y1, x2, y2) coordinates based on your PNGs.
 CELL_CONFIG = {
-    '1_PatientName': {'coords': (100, 100, 500, 200), 'method': 'default'},
-    '2_PolicyNum':   {'coords': (100, 250, 500, 350), 'method': 'digits_only'},
-    '3_DateOfServ':  {'coords': (100, 400, 500, 500), 'method': 'default'},
-    '4_Diagnosis':   {'coords': (100, 550, 500, 650), 'method': 'default'},
-    '5_TotalAmt':    {'coords': (600, 100, 900, 200), 'method': 'digits_only'},
-    '6_ProviderID':  {'coords': (600, 250, 900, 350), 'method': 'digits_only'},
-    '7_Signature':   {'coords': (600, 400, 900, 500), 'method': 'signature_check'},
-    '8_Notes':       {'coords': (600, 550, 900, 650), 'method': 'default'},
+    'Region_1': {
+        'coords': (100, 100, 500, 300),  # (x1, y1, x2, y2)
+        'method': 'default'              # Options: 'default', 'digits_only', 'signature_check'
+    },
+    'Region_2': {
+        'coords': (100, 500, 900, 800),  # (x1, y1, x2, y2)
+        'method': 'default'
+    }
 }
 
 # =============================================================================
@@ -163,7 +161,7 @@ def run_stage_1_preprocessing():
         cv2.imwrite(os.path.join(INTERMEDIATE_PNG_FOLDER, save_name), final_img)
 
 def run_stage_2_extraction():
-    """Converts PNG -> 8 Cell Crops -> Excel Report."""
+    """Converts PNG -> 2 Cell Crops -> Excel Report."""
     print("\n--- STAGE 2: Extraction (PNG to Data) ---")
     os.makedirs(FINAL_OUTPUT_FOLDER, exist_ok=True)
     
@@ -188,7 +186,7 @@ def run_stage_2_extraction():
         
         row_data = {'Filename': fname}
         
-        # Process 8 Cells
+        # Loop through the 2 Configured Regions
         for key, conf in CELL_CONFIG.items():
             x1, y1, x2, y2 = conf['coords']
             method = conf['method']
@@ -219,16 +217,15 @@ def run_stage_2_extraction():
 # =============================================================================
 
 def main():
-    print("=== STARTING AUTOMATED PIPELINE ===")
+    print("=== STARTING AUTOMATED PIPELINE (2-REGION CROP) ===")
     
     # 1. Run TIFF -> PNG
     run_stage_1_preprocessing()
     
-    # 2. Run PNG -> Data
+    # 2. Run PNG -> 2 Crops -> Data
     run_stage_2_extraction()
     
     print("\n=== PIPELINE COMPLETE ===")
 
-# Run the main function
 if __name__ == "__main__":
     main()
