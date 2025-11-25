@@ -1,92 +1,107 @@
-def run_stage_2_extraction():
-    """Converts PNG -> Dynamic Cell Crops -> Excel Report."""
-    print("\n--- STAGE 2: Extraction (PNG to Data) ---")
-    os.makedirs(FINAL_OUTPUT_FOLDER, exist_ok=True)
+import base64
+import os
+from openai import OpenAI
+
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
+# ❗ Replace with your actual key
+API_KEY = "YOUR_OPENAI_API_KEY" 
+
+# If you are using your corporate gateway, update this:
+# BASE_URL = "https://gateway.ai.humana.com/openai/deployments/gpt-4o" 
+# client = OpenAI(api_key=API_KEY, base_url=BASE_URL, ...)
+
+# For standard OpenAI usage:
+client = OpenAI(api_key=API_KEY)
+
+IMAGE_PATH = "test_document.png" # <--- PUT YOUR IMAGE NAME HERE
+
+# ==========================================
+# 2. HELPER: ENCODE IMAGE
+# ==========================================
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+# ==========================================
+# 3. THE "STRUCTURE PRESERVING" PROMPT
+# ==========================================
+def get_ocr_prompt():
+    return """
+    You are an advanced Optical Character Recognition (OCR) and Document Layout Analysis engine.
     
-    files = glob.glob(os.path.join(INTERMEDIATE_PNG_FOLDER, '*.png'))
-    if not files:
-        print("No PNG files found to extract.")
+    YOUR TASK:
+    1. Transcribe the text from the provided image EXACTLY as it appears.
+    2. PRESERVE THE STRUCTURE: 
+       - If there is a table, output a Markdown table.
+       - If there are columns, represent them visually or logically grouping them.
+       - If there are checkboxes, mark them as [x] or [ ].
+    3. OVERLAPPING TEXT: 
+       - If a stamp or signature overlaps text, prioritize extracting the underlying typed text first. 
+       - Then, note the stamp/signature content in brackets, e.g., "[Stamp: APPROVED]".
+    4. NO SUMMARIZATION: Do not explain the document. Do not summarize it. Output ONLY the content.
+    
+    Output Format: Markdown
+    """
+
+# ==========================================
+# 4. MAIN EXECUTION
+# ==========================================
+def process_image():
+    if not os.path.exists(IMAGE_PATH):
+        print(f"Error: File {IMAGE_PATH} not found.")
         return
 
-    all_data = []
-    
-    for i, fpath in enumerate(files):
-        fname = os.path.basename(fpath)
-        base_name = os.path.splitext(fname)[0]
-        print(f"Extracting {i+1}/{len(files)}: {fname}")
-        
-        full_img = cv2.imread(fpath)
-        if full_img is None: continue
-        
-        # Get dimensions for "bottom right most end" logic
-        h, w = full_img.shape[:2]
-            
-        # Setup subfolder
-        subfolder = os.path.join(FINAL_OUTPUT_FOLDER, base_name)
-        os.makedirs(subfolder, exist_ok=True)
-        
-        row_data = {'Filename': fname}
-        
-        # =========================================================
-        # DYNAMIC COORDINATE LOGIC
-        # =========================================================
-        
-        # Check if file is Grid or NGrid
-        is_grid = fname.startswith("Grid_")
-        
-        # --- Define Region 1 (Bottom Area) ---
-        # Logic: Start at 21, 3111 and go to the absolute bottom-right (w, h)
-        # "if non grid same" -> implies logic applies to both
-        r1_coords = (21, 3111, w, h)
-        
-        # --- Define Region 2 (Specific Block) ---
-        if is_grid:
-            # Grid Coordinates
-            r2_coords = (1927, 2111, 2415, 3051)
-        else:
-            # Non-Grid Coordinates
-            r2_coords = (1971, 2261, 2455, 3000)
+    print(f"Encoding image: {IMAGE_PATH}...")
+    base64_image = encode_image(IMAGE_PATH)
 
-        # Pack into a temporary config list for processing
-        current_file_config = {
-            'Region_1': {'coords': r1_coords, 'method': 'default'},
-            'Region_2': {'coords': r2_coords, 'method': 'default'}
-        }
+    print("Sending to GPT-4o (Detail: HIGH)...")
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": get_ocr_prompt()
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text", 
+                            "text": "Extract the structured text from this image."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                # ❗ CRITICAL: 'high' forces the model to look at 512x512 tiles
+                                "detail": "high" 
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4096,
+            temperature=0  # ❗ CRITICAL: 0 reduces hallucinations
+        )
+
+        result = response.choices[0].message.content
         
-        # =========================================================
-        # PROCESSING LOOP
-        # =========================================================
-        for key, conf in current_file_config.items():
-            x1, y1, x2, y2 = conf['coords']
-            method = conf['method']
-            
-            # Safety Bounds: Ensure we don't crop outside the image
-            # "pixels will be out of range... avoid them and get end most point"
-            safe_x1 = max(0, x1)
-            safe_y1 = max(0, y1)
-            safe_x2 = min(w, x2)
-            safe_y2 = min(h, y2)
-            
-            # Sanity Check: valid crop area
-            if safe_x2 > safe_x1 and safe_y2 > safe_y1:
-                crop = full_img[safe_y1:safe_y2, safe_x1:safe_x2]
-                
-                # Save Crop
-                cv2.imwrite(os.path.join(subfolder, f"{key}.png"), crop)
-                
-                # Extract
-                text = extract_data_from_cell(crop, method)
-                row_data[key] = text
-            else:
-                print(f"   -> Warning: Invalid coords for {key} in {fname}")
-                row_data[key] = "ERROR_COORDS"
-            
-        all_data.append(row_data)
+        print("\n" + "="*40)
+        print("GPT-4o EXTRACTION RESULT")
+        print("="*40 + "\n")
+        print(result)
         
-    # Save Excel
-    if all_data:
-        df = pd.DataFrame(all_data)
-        out_path = os.path.join(FINAL_OUTPUT_FOLDER, 'Final_Report.xlsx')
-        df.to_excel(out_path, index=False)
-        print(f"\nSUCCESS! Report saved to: {out_path}")
-        print(df.head())
+        # Save to file
+        with open("gpt4o_output.md", "w", encoding="utf-8") as f:
+            f.write(result)
+        print("\nSaved output to 'gpt4o_output.md'")
+
+    except Exception as e:
+        print(f"Error calling API: {e}")
+
+if __name__ == "__main__":
+    process_image()
