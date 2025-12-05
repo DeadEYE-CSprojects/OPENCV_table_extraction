@@ -1,3 +1,42 @@
+def detect_form_with_llm(image):
+    """
+    Crops the header and uses the LLM to decide if it's CMS 1500 or 1450.
+    """
+    h, w = image.shape[:2]
+    
+    # 1. Crop the top 30% (Header area)
+    # This contains the QR code AND the Form Title text
+    header_crop = image[0:int(h*0.3), 0:w]
+    
+    # 2. Define strict instruction for the LLM
+    instruction = (
+        "Analyze this document header. Determine the Form Type. "
+        "Rules: "
+        "1. If you see 'HEALTH INSURANCE CLAIM FORM' or a QR code on the left, it is 'CMS 1500'. "
+        "2. If you see 'UB-04' or 'CMS 1450', it is 'CMS 1450'. "
+        "Return the result as a single key JSON: {\"Type\": \"CMS 1500\"} or {\"Type\": \"CMS 1450\"}"
+    )
+    
+    # 3. Call your existing smart agent
+    # We pass an empty context string "" because we don't need correction, just classification
+    try:
+        response = call_smart_agent(header_crop, instruction, "")
+        
+        # Handle cases where response might be a string or dict
+        # Assuming call_smart_agent returns a dictionary like row.update(data) expects
+        if isinstance(response, dict):
+            return response.get("Type", "CMS 1500") # Default to 1500 if key missing
+        else:
+            # If it returned a string, sanitize it
+            text = str(response).upper()
+            if "1450" in text or "UB" in text:
+                return "CMS 1450"
+            return "CMS 1500"
+            
+    except Exception as e:
+        print(f"LLM Classification failed: {e}. Defaulting to CMS 1500.")
+        return "CMS 1500"
+
 import os
 import cv2
 import numpy as np
