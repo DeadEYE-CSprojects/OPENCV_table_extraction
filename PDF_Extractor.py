@@ -1,3 +1,52 @@
+def detect_form_type_hybrid(image):
+    """
+    Checks for QR Code first. If not found, checks for Header Text (OCR).
+    If either confirms CMS 1500, returns 'CMS 1500'. Else 'CMS 1450'.
+    """
+    h, w = image.shape[:2]
+
+    # --- CHECK 1: QR CODE DETECTION ---
+    # ROI: Top 30% height, Left 25% width
+    qr_roi = image[0:int(h * 0.30), 0:int(w * 0.25)]
+    
+    # Convert to Binary (Black & White) for best QR detection
+    if len(qr_roi.shape) == 3:
+        gray_qr = cv2.cvtColor(qr_roi, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_qr = qr_roi
+    _, binary_qr = cv2.threshold(gray_qr, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    # Detect
+    detector = cv2.QRCodeDetector()
+    data, points, _ = detector.detectAndDecode(binary_qr)
+    
+    if points is not None:
+        return "CMS 1500"  # Found QR -> It's definitely 1500
+
+    # --- CHECK 2: TEXT OCR (FALLBACK) ---
+    # ROI: Top 20% of the entire width (Header Title Area)
+    header_roi = image[0:int(h * 0.20), 0:w]
+    
+    # Pre-process for OCR
+    if len(header_roi.shape) == 3:
+        gray_header = cv2.cvtColor(header_roi, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_header = header_roi
+    _, binary_header = cv2.threshold(gray_header, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    # Run Tesseract
+    # psm 6 = Assume a single uniform block of text
+    text = pytesseract.image_to_string(binary_header, config='--psm 6').upper()
+
+    # check keywords
+    if "HEALTH INSURANCE" in text or "CLAIM FORM" in text:
+        return "CMS 1500"
+    
+    # --- CHECK 3: DEFAULT ---
+    return "CMS 1450"
+
+
+
 def detect_form_with_llm(image):
     """
     Crops the header and uses the LLM to decide if it's CMS 1500 or 1450.
