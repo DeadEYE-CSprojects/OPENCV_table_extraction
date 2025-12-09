@@ -1,91 +1,3 @@
-def detect_form_type_hybrid(image):
-    """
-    Checks for QR Code first. If not found, checks for Header Text (OCR).
-    If either confirms CMS 1500, returns 'CMS 1500'. Else 'CMS 1450'.
-    """
-    h, w = image.shape[:2]
-
-    # --- CHECK 1: QR CODE DETECTION ---
-    # ROI: Top 30% height, Left 25% width
-    qr_roi = image[0:int(h * 0.30), 0:int(w * 0.25)]
-    
-    # Convert to Binary (Black & White) for best QR detection
-    if len(qr_roi.shape) == 3:
-        gray_qr = cv2.cvtColor(qr_roi, cv2.COLOR_BGR2GRAY)
-    else:
-        gray_qr = qr_roi
-    _, binary_qr = cv2.threshold(gray_qr, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-
-    # Detect
-    detector = cv2.QRCodeDetector()
-    data, points, _ = detector.detectAndDecode(binary_qr)
-    
-    if points is not None:
-        return "CMS 1500"  # Found QR -> It's definitely 1500
-
-    # --- CHECK 2: TEXT OCR (FALLBACK) ---
-    # ROI: Top 20% of the entire width (Header Title Area)
-    header_roi = image[0:int(h * 0.20), 0:w]
-    
-    # Pre-process for OCR
-    if len(header_roi.shape) == 3:
-        gray_header = cv2.cvtColor(header_roi, cv2.COLOR_BGR2GRAY)
-    else:
-        gray_header = header_roi
-    _, binary_header = cv2.threshold(gray_header, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-
-    # Run Tesseract
-    # psm 6 = Assume a single uniform block of text
-    text = pytesseract.image_to_string(binary_header, config='--psm 6').upper()
-
-    # check keywords
-    if "HEALTH INSURANCE" in text or "CLAIM FORM" in text:
-        return "CMS 1500"
-    
-    # --- CHECK 3: DEFAULT ---
-    return "CMS 1450"
-
-
-
-def detect_form_with_llm(image):
-    """
-    Crops the header and uses the LLM to decide if it's CMS 1500 or 1450.
-    """
-    h, w = image.shape[:2]
-    
-    # 1. Crop the top 30% (Header area)
-    # This contains the QR code AND the Form Title text
-    header_crop = image[0:int(h*0.3), 0:w]
-    
-    # 2. Define strict instruction for the LLM
-    instruction = (
-        "Analyze this document header. Determine the Form Type. "
-        "Rules: "
-        "1. If you see 'HEALTH INSURANCE CLAIM FORM' or a QR code on the left, it is 'CMS 1500'. "
-        "2. If you see 'UB-04' or 'CMS 1450', it is 'CMS 1450'. "
-        "Return the result as a single key JSON: {\"Type\": \"CMS 1500\"} or {\"Type\": \"CMS 1450\"}"
-    )
-    
-    # 3. Call your existing smart agent
-    # We pass an empty context string "" because we don't need correction, just classification
-    try:
-        response = call_smart_agent(header_crop, instruction, "")
-        
-        # Handle cases where response might be a string or dict
-        # Assuming call_smart_agent returns a dictionary like row.update(data) expects
-        if isinstance(response, dict):
-            return response.get("Type", "CMS 1500") # Default to 1500 if key missing
-        else:
-            # If it returned a string, sanitize it
-            text = str(response).upper()
-            if "1450" in text or "UB" in text:
-                return "CMS 1450"
-            return "CMS 1500"
-            
-    except Exception as e:
-        print(f"LLM Classification failed: {e}. Defaulting to CMS 1500.")
-        return "CMS 1500"
-
 import os
 import cv2
 import numpy as np
@@ -94,15 +6,22 @@ import json
 import base64
 import pandas as pd
 import shutil
-import time
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.styles import Alignment
 from openai import AzureOpenAI, OpenAI
 
+# Try importing pdf2image for PDF support
+try:
+    from pdf2image import convert_from_path
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+    print("Warning: 'pdf2image' not installed. PDF files will be skipped.")
+
 # ==========================================
-# 1. USER CONFIGURATION (EDIT PATHS HERE)
+# 1. USER CONFIGURATION
 # ==========================================
 
 # !!! ENTER YOUR API KEY HERE !!!
@@ -110,17 +29,18 @@ API_KEY = "YOUR_OPENAI_API_KEY_HERE"
 
 # Client Initialization (Uncomment the one you use)
 # client = OpenAI(api_key=API_KEY)
-# client = AzureOpenAI(api_key=API_KEY, api_version="2024-02-01", azure_endpoint="YOUR_ENDPOINT")
+client = AzureOpenAI(api_key=API_KEY, api_version="2024-02-01", azure_endpoint="YOUR_ENDPOINT")
 
-# !!! UPDATE YOUR FOLDER PATH HERE !!!
+# PATHS
 BASE_FOLDER = r'C:\CMS_Project' 
 
-INPUT_FOLDER = os.path.join(BASE_FOLDER, 'Input_Raw')
-INTERMEDIATE_FOLDER = os.path.join(BASE_FOLDER, 'Intermediate_Processed')
-FINAL_EXCEL_FOLDER = os.path.join(BASE_FOLDER, 'Final_Reports')
+FOLDER_1_PNG = os.path.join(BASE_FOLDER, '1_Standardized_PNG')
+FOLDER_2_FORMS = os.path.join(BASE_FOLDER, '2_Aligned_Forms')
+FOLDER_3_REGIONS = os.path.join(BASE_FOLDER, '3_Region_Crops')
+FOLDER_4_REPORT = os.path.join(BASE_FOLDER, '4_Final_Reports')
 
 BATCH_SIZE = 100 
-TARGET_SIZE = (2480, 3508) # Standard CMS1500 dimensions
+TARGET_SIZE = (2480, 3508) # Standard CMS1500 dimensions (A4 @ 300DPI approx)
 
 # ==========================================
 # 2. SMART CONFIGURATION (THE BRAIN)
@@ -135,36 +55,18 @@ SMART_CONFIG = {
         2. "4" vs "1": Watch for '4' being misread as '1'.
         3. "8" vs "2" or "B": '8' is often misread as '2', 'B', or '3'.
         4. "5" vs "6": Differentiate carefully.
-        5. "ZZ" vs "22": In ID columns, 'ZZ' is a qualifier, '22' might be a Place of Service code.
-        6. NPI check: NPI is ALWAYS a 10-digit number.
+        5. NPI check: NPI is ALWAYS a 10-digit number.
         """,
         "Regions": {
-            # --- REGION 1: Bottom Blocks (31, 32, 33) ---
-            "Region_1_Bottom": [0, 0, 0, 0, # <--- UPDATE COORDS (x1, y1, x2, y2)
+            # Format: [x1, y1, x2, y2, "Instruction"]
+            "Region_1_Bottom": [0, 0, 0, 0, 
                                 """
-                                Extract the following blocks:
-                                1. Block 31: Signed? (Yes/No), Signature Name (Text).
-                                2. Block 32: Facility Name, 32a (NPI - 10 digits), 32b (Alphanumeric/Numeric).
-                                3. Block 33: Billing Provider Name, 33a (NPI), 33b (Alphanumeric).
-                                
-                                Return JSON Keys: 
-                                B31_Is_Signed, B31_Sign_Name, B32_Facility_Name, B32a_NPI, B32b_OtherID, B33_Billing_Name, B33a_NPI, B33b_OtherID
+                                Extract Block 31 (Signature), Block 32 (Facility), Block 33 (Billing Provider).
+                                Return JSON Keys: B31_Sign_Name, B32_Facility_Name, B33_Billing_Name
                                 """],
-            
-            # --- REGION 2: Service Lines (Block 24 I & J) ---
-            "Region_2_Services": [0, 0, 0, 0, # <--- UPDATE COORDS (x1, y1, x2, y2)
+            "Region_2_Services": [0, 0, 0, 0, 
                                   """
-                                  Focus on Block 24, Columns I (Qualifier) and J (Rendering Provider ID).
-                                  - There may be multiple rows.
-                                  - Data is often stacked in Col J (e.g., top is alphanumeric, bottom is NPI).
-                                  - Capture PAIRS of (Indicator, Value).
-                                  
-                                  Example Output Format:
-                                  "Row1": "(ZZ, NPI): (AB123, 1234567890)"
-                                  "Row2": "(G2, NPI): (XY999, 9876543210)"
-                                  
-                                  Return JSON Keys:
-                                  B24_Row1_Data, B24_Row2_Data, B24_Row3_Data, B24_Row4_Data, B24_Row5_Data, B24_Row6_Data
+                                  Extract Block 24 (Service Lines). Return JSON Keys: B24_Row1_Data, B24_Row2_Data
                                   """]
         }
     },
@@ -175,71 +77,48 @@ SMART_CONFIG = {
         CRITICAL OCR CORRECTION RULES:
         1. NPI Numbers are 10 digits.
         2. TIN/EIN is usually 9 digits.
-        3. Qualifiers are usually 2 letters (e.g., 1G, G2, 0B).
-        4. Do not confuse 'O' (Letter) with '0' (Zero).
         """,
         "Regions": {
-            # --- REGION 1: Top Left (Provider/Pay-to/Tax) ---
-            "Region_1_Header": [0, 0, 0, 0, # <--- UPDATE COORDS
+            "Region_1_Header": [0, 0, 0, 0, 
                                 """
-                                Extract:
-                                1. Block 1: Provider Name (Name only).
-                                2. Block 2: Pay-to Address (Full address).
-                                3. Block 5: Fed Tax No (TIN/EIN).
-                                
-                                Return JSON Keys:
-                                B1_Provider_Name, B2_PayTo_Address, B5_TaxID
+                                Extract Block 1 (Name), Block 2 (Pay-to), Block 5 (Tax ID).
+                                Return JSON Keys: B1_Name, B2_PayTo, B5_TaxID
                                 """],
-
-            # --- REGION 2: Middle Right (NPIs) ---
-            "Region_2_NPIs": [0, 0, 0, 0, # <--- UPDATE COORDS
+            "Region_2_NPIs": [0, 0, 0, 0, 
                               """
-                              Extract:
-                              1. Block 56: NPI (Billing Provider).
-                              2. Block 57: Other Provider ID.
-                              
-                              Return JSON Keys:
-                              B56_Billing_NPI, B57_Other_ID
-                              """],
-
-            # --- REGION 3: Attending/Operating (Blocks 76-79) ---
-            "Region_3_Providers": [0, 0, 0, 0, # <--- UPDATE COORDS
-                                   """
-                                   For Blocks 76, 77, 78, and 79, extract the sub-fields:
-                                   - a (NPI)
-                                   - b (Qual)
-                                   - c (Last Name)
-                                   - d (First Name)
-                                   
-                                   Return JSON Keys:
-                                   B76_Attending_NPI, B76_Qual, B76_Last, B76_First,
-                                   B77_Operating_NPI, B77_Qual, B77_Last, B77_First,
-                                   B78_Other_NPI, B78_Qual, B78_Last, B78_First,
-                                   B79_Other_NPI, B79_Qual, B79_Last, B79_First
-                                   """],
-
-            # --- REGION 4: Block 81 (Code-Code) ---
-            "Region_4_Codes": [0, 0, 0, 0, # <--- UPDATE COORDS
-                               """
-                               Extract Block 81 (Code-Code Field). 
-                               There are 4 rows (a, b, c, d). Extract all text from each line.
-                               
-                               Return JSON Keys:
-                               B81a_Details, B81b_Details, B81c_Details, B81d_Details
-                               """]
+                              Extract Block 56 (NPI) and 57 (Other ID).
+                              Return JSON Keys: B56_NPI, B57_OtherID
+                              """]
         }
     }
 }
 
 # ==========================================
-# 3. COMPLETE PRE-PROCESSING FUNCTIONS
+# 3. HELPER FUNCTIONS (IMAGE & UTILS)
 # ==========================================
 
+def convert_to_opencv_image(filepath):
+    """Converts PDF or Image file to OpenCV format (numpy array)."""
+    ext = os.path.splitext(filepath)[1].lower()
+    
+    if ext == '.pdf':
+        if not PDF_SUPPORT: return None
+        try:
+            # Convert first page only
+            pages = convert_from_path(filepath, first_page=1, last_page=1, dpi=300)
+            if pages:
+                return cv2.cvtColor(np.array(pages[0]), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"PDF Error {filepath}: {e}")
+            return None
+
+    elif ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
+        return cv2.imread(filepath)
+    
+    return None
+
 def deskew_single_image(image):
-    """
-    Deskews an image using projection profiles.
-    Crucial for aligning the grid lines.
-    """
+    """Corrects image rotation (skew)."""
     if image is None: return None
     h, w = image.shape[:2]
     
@@ -259,8 +138,6 @@ def deskew_single_image(image):
         scores.append(score)
     
     best_angle = angles[np.argmax(scores)]
-    # print(f"   -> Deskewing by {best_angle} degrees")
-    
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
     
@@ -268,50 +145,32 @@ def deskew_single_image(image):
                           borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
 
 def detect_form_type_by_qr(image):
-    """
-    Analyzes the Top-Left of the image (first 1000px) for a QR Code.
-    - Found = CMS1500
-    - Not Found = CMS1450 (UB04)
-    """
-    # Look at a generous top-left crop to catch the QR even if margins vary
+    """Uses LLM to detect if form is CMS1500 or CMS1450."""
     h, w = image.shape[:2]
-    crop_size = min(1000, w, h)
-    tl_crop = image[0:crop_size, 0:crop_size]
+    header_crop = image[0:int(h*0.3), 0:w]
     
-    # 1. Standard QR Detection
-    detector = cv2.QRCodeDetector()
-    retval, decoded_info, points, straight_qrcode = detector.detectAndDecodeMulti(tl_crop)
+    instruction = (
+        "Analyze this document header. Determine the Form Type. "
+        "Rules: "
+        "1. If 'HEALTH INSURANCE CLAIM FORM' or QR code on left -> 'CMS1500'. "
+        "2. If 'UB-04' or 'CMS 1450' -> 'CMS1450'. "
+        "Return JSON: {\"Type\": \"CMS1500\"} or {\"Type\": \"CMS1450\"}"
+    )
     
-    if retval:
+    try:
+        response = call_smart_agent(header_crop, instruction, "")
+        if isinstance(response, dict):
+            return response.get("Type", "CMS1500")
+        return "CMS1500" # Default
+    except:
         return "CMS1500"
-        
-    # 2. Heuristic: Look for dense black square (Fall back if QR is blurry)
-    gray = cv2.cvtColor(tl_crop, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for c in cnts:
-        x, y, cw, ch = cv2.boundingRect(c)
-        aspect = float(cw) / ch
-        # QRs are roughly square and usually > 50px
-        if 50 < cw < 500 and 50 < ch < 500 and 0.8 < aspect < 1.2:
-            roi = thresh[y:y+ch, x:x+cw]
-            density = cv2.countNonZero(roi) / (cw * ch)
-            # High density of black pixels = likely a QR/DataMatrix
-            if density > 0.4: 
-                return "CMS1500"
-                
-    return "CMS1450"
 
 def detect_and_crop_grid(image):
-    """
-    Detects the main table grid and crops to TARGET_SIZE.
-    """
+    """Detects the main table grid lines and crops to them."""
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
     
-    # Horizontal & Vertical Lines
     hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 38, 1))
     ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, h // 380))
     
@@ -326,21 +185,16 @@ def detect_and_crop_grid(image):
     if cnts:
         largest = max(cnts, key=cv2.contourArea)
         x, y, cw, ch = cv2.boundingRect(largest)
-        
-        # Validation: Grid must be >10% of image
         if (cw * ch) > (0.1 * w * h): 
             pad = 20
-            # Safe Crop
             y1, y2 = max(0, y-pad), min(h, y+ch+pad)
             x1, x2 = max(0, x-pad), min(w, x+cw+pad)
-            
             crop = image[y1:y2, x1:x2]
             return True, cv2.resize(crop, TARGET_SIZE, interpolation=cv2.INTER_AREA)
-            
     return False, None
 
 def find_anchors_and_crop(image):
-    """Fallback Cropping logic if Grid fails."""
+    """Fallback cropping if grid detection fails."""
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)[1]
@@ -350,7 +204,6 @@ def find_anchors_and_crop(image):
     
     if not cnts: return cv2.resize(image, TARGET_SIZE)
     
-    # Top-Left (Smallest x+y) & Bottom-Right (Largest x+y+w+h)
     tl_c = min(cnts, key=lambda c: cv2.boundingRect(c)[0] + cv2.boundingRect(c)[1])
     br_c = max(cnts, key=lambda c: cv2.boundingRect(c)[0] + cv2.boundingRect(c)[1] + cv2.boundingRect(c)[2] + cv2.boundingRect(c)[3])
     
@@ -371,139 +224,253 @@ def encode_image(image_arr):
     return base64.b64encode(buffer).decode('utf-8')
 
 def call_smart_agent(crop_img, instruction, context):
-    """Calls OpenAI GPT-4o with image and instructions."""
+    """Sends image crop to OpenAI."""
     if crop_img is None: return {}
+    
+    # Upscale very small crops for better OCR
+    h,w = crop_img.shape[:2]
+    if h < 200:
+        crop_img = cv2.resize(crop_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
     b64_img = encode_image(crop_img)
     
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": f"Medical OCR Agent. OUTPUT JSON ONLY.\nCONTEXT & ERROR CHECKING:\n{context}"},
+                {"role": "system", "content": f"Medical OCR Agent. OUTPUT JSON ONLY.\n{context}"},
                 {"role": "user", "content": [
                     {"type": "text", "text": instruction},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}", "detail": "high"}}
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                 ]}
             ],
             temperature=0, 
-            max_tokens=1000
+            max_tokens=800
         )
         content = response.choices[0].message.content.strip().replace("```json", "").replace("```", "")
         return json.loads(content)
     except Exception as e:
-        print(f"   -> LLM Error: {e}")
-        return {"Error": "Agent_Failed"}
+        print(f"   -> AI Error: {e}")
+        return {}
 
 def save_excel(data, filepath):
-    """Saves data to Excel with formatting."""
+    """Saves list of dicts to Excel with appending support."""
     if not data: return
     df = pd.DataFrame(data)
     
-    # Move Filename to front
+    # Ensure Filename is first column
     cols = list(df.columns)
     if 'Filename' in cols: cols.insert(0, cols.pop(cols.index('Filename')))
     df = df[cols]
     
-    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Data')
-        
+    if not os.path.exists(filepath):
+        df.to_excel(filepath, index=False)
+    else:
+        with pd.ExcelWriter(filepath, mode='a', engine='openpyxl', if_sheet_exists='overlay') as writer:
+            writer.workbook = load_workbook(filepath)
+            start_row = writer.workbook.active.max_row
+            df.to_excel(writer, index=False, header=False, startrow=start_row)
+
+    # Styling
     wb = load_workbook(filepath)
-    ws = wb['Data']
-    
-    # Create Table
-    tab = Table(displayName="SmartTable", ref=ws.dimensions)
+    ws = wb.active
+    tab = Table(displayName="Data", ref=ws.dimensions)
     tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
-    ws.add_table(tab)
+    try: ws.add_table(tab)
+    except: pass # Table might already exist
     
-    # Format Columns
-    for col in ws.columns:
-        length = max(len(str(c.value)) for c in col)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = min(length + 2, 50)
-        for c in col: 
-            c.alignment = Alignment(wrap_text=True, vertical='top')
-        
     wb.save(filepath)
 
 # ==========================================
-# 5. MAIN EXECUTION PIPELINE
+# PHASE 1: STANDARDIZE TO PNG
 # ==========================================
-
-def main():
-    print("--- STARTING MEDICAL FORM EXTRACTOR ---")
-    os.makedirs(INTERMEDIATE_FOLDER, exist_ok=True)
-    os.makedirs(FINAL_EXCEL_FOLDER, exist_ok=True)
+def run_phase_1_conversion(input_folder):
+    print("\n--- PHASE 1: CONVERTING RAW FILES TO PNG ---")
+    os.makedirs(FOLDER_1_PNG, exist_ok=True)
     
-    files = glob.glob(os.path.join(INPUT_FOLDER, '*.*'))
-    print(f"Found {len(files)} files in Input folder.")
+    files = glob.glob(os.path.join(input_folder, '*.*'))
+    count = 0
     
-    # PROCESS IN BATCHES
-    for i in range(0, len(files), BATCH_SIZE):
-        batch = files[i : i + BATCH_SIZE]
-        print(f"\n--- Processing Batch {i//BATCH_SIZE + 1} ({len(batch)} files) ---")
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        dest_path = os.path.join(FOLDER_1_PNG, os.path.splitext(fname)[0] + ".png")
         
-        results = {k: [] for k in SMART_CONFIG.keys()}
-        
-        for fpath in batch:
-            original_fname = os.path.basename(fpath)
-            print(f"Reading: {original_fname}...")
-            
-            img = cv2.imread(fpath)
-            if img is None: continue
-            
-            # --- STEP 1: DESKEW (Align Rotation) ---
-            deskewed_img = deskew_single_image(img)
-            
-            # --- STEP 2: DETECT TYPE BY QR (Top Left) ---
-            # We check the deskewed image so coordinates are reliable
-            active_type = detect_form_type_by_qr(deskewed_img)
-            print(f"   -> Classified as: {active_type}")
-            
-            # --- STEP 3: CROP TO GRID (Normalize to 2480x3508) ---
-            is_grid, processed_img = detect_and_crop_grid(deskewed_img)
-            if not is_grid:
-                # Fallback if grid detection fails
-                processed_img = find_anchors_and_crop(deskewed_img)
-            
-            # --- STEP 4: SAVE INTERMEDIATE (With Classification Name) ---
-            new_fname = f"{active_type}_{original_fname}"
-            if not new_fname.endswith(".png"): new_fname += ".png"
-            
-            save_path = os.path.join(INTERMEDIATE_FOLDER, new_fname)
-            cv2.imwrite(save_path, processed_img)
-            
-            # --- STEP 5: EXTRACT DATA ---
-            row = {"Filename": new_fname, "Form_Type": active_type}
-            cfg = SMART_CONFIG[active_type]
-            
-            for r_key, params in cfg['Regions'].items():
-                x1, y1, x2, y2 = params[0], params[1], params[2], params[3]
-                instruction = params[4]
-                
-                # Skip if coordinates are not set yet (0,0,0,0)
-                if x1 == 0 and x2 == 0:
-                    continue
-                    
-                # CROP REGION
-                crop = processed_img[int(y1):int(y2), int(x1):int(x2)]
-                
-                # CALL AI
-                data = call_smart_agent(crop, instruction, cfg['Correction_Context'])
-                row.update(data)
-                
-            results[active_type].append(row)
-            
-        # --- STEP 6: SAVE EXCEL BATCH ---
-        timestamp = int(time.time())
-        
-        for f_type, rows in results.items():
-            if rows:
-                base_name = SMART_CONFIG[f_type]['Excel_Filename']
-                # Create unique batch name
-                fname = base_name.replace(".xlsx", f"_Batch_{timestamp}.xlsx")
-                save_excel(rows, os.path.join(FINAL_EXCEL_FOLDER, fname))
-                print(f"Saved Batch Report: {fname}")
-                
-        print("Batch Memory Cleared.")
+        if os.path.exists(dest_path): continue
 
+        img = convert_to_opencv_image(fpath)
+        if img is not None:
+            cv2.imwrite(dest_path, img)
+            count += 1
+            if count % 10 == 0: print(f"Converted {count} files...")
+    
+    print(f"Phase 1 Complete. {count} new files created.")
+
+# ==========================================
+# PHASE 2: ALIGN & CLASSIFY
+# ==========================================
+def run_phase_2_preprocessing():
+    print("\n--- PHASE 2: DESKEW, CROP & CLASSIFY ---")
+    os.makedirs(FOLDER_2_FORMS, exist_ok=True)
+    
+    files = glob.glob(os.path.join(FOLDER_1_PNG, '*.png'))
+    
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        
+        # NOTE: We can't check 'if exists' simply by name because output name changes based on Type.
+        # But we can check if any file ending in _{fname} exists in Folder 2.
+        
+        img = cv2.imread(fpath)
+        if img is None: continue
+
+        # 1. Deskew
+        deskewed = deskew_single_image(img)
+        
+        # 2. Detect Type (Needed for filename)
+        form_type = detect_form_type_by_qr(deskewed)
+        
+        # 3. Crop to Grid
+        is_grid, processed = detect_and_crop_grid(deskewed)
+        if not is_grid:
+            processed = find_anchors_and_crop(deskewed)
+
+        # 4. Save: Format = "Type_OriginalName.png"
+        new_name = f"{form_type}_{fname}"
+        save_path = os.path.join(FOLDER_2_FORMS, new_name)
+        
+        if not os.path.exists(save_path):
+            cv2.imwrite(save_path, processed)
+            print(f"Processed: {new_name}")
+
+# ==========================================
+# PHASE 3: CROP REGIONS
+# ==========================================
+def run_phase_3_region_cropping():
+    print("\n--- PHASE 3: CUTTING REGIONS TO FOLDERS ---")
+    
+    files = glob.glob(os.path.join(FOLDER_2_FORMS, '*.png'))
+    
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        
+        # Parse Type from Filename (e.g., "CMS1500_File1.png")
+        parts = fname.split('_', 1)
+        if len(parts) < 2: continue # Safety check
+        
+        form_type = parts[0] # "CMS1500"
+        original_name = parts[1] # "File1.png"
+        clean_name = os.path.splitext(original_name)[0]
+        
+        # FOLDER NAME FORMAT: "CMS1500_File1"
+        # This contains BOTH Type and Name, easy for Phase 4.
+        folder_name = f"{form_type}_{clean_name}"
+        file_crop_dir = os.path.join(FOLDER_3_REGIONS, folder_name)
+        os.makedirs(file_crop_dir, exist_ok=True)
+
+        if form_type not in SMART_CONFIG: continue
+
+        img = cv2.imread(fpath)
+        h, w = img.shape[:2]
+        cfg = SMART_CONFIG[form_type]
+        PAD = 20
+
+        # Crop all regions in config
+        for r_key, params in cfg['Regions'].items():
+            x1, y1, x2, y2, _ = params
+            
+            if x1 == 0 and x2 == 0: continue
+
+            y1_pad, y2_pad = max(0, int(y1)-PAD), min(h, int(y2)+PAD)
+            x1_pad, x2_pad = max(0, int(x1)-PAD), min(w, int(x2)+PAD)
+
+            crop = img[y1_pad:y2_pad, x1_pad:x2_pad]
+            
+            # Save: "Region_Name.png" inside the specific file folder
+            cv2.imwrite(os.path.join(file_crop_dir, f"{r_key}.png"), crop)
+        
+        print(f"Crops ready for: {folder_name}")
+
+# ==========================================
+# PHASE 4: AI EXTRACTION
+# ==========================================
+def run_phase_4_extraction():
+    print("\n--- PHASE 4: AI EXTRACTION ---")
+    os.makedirs(FOLDER_4_REPORT, exist_ok=True)
+    
+    # Get all sub-folders in Folder 3
+    doc_folders = glob.glob(os.path.join(FOLDER_3_REGIONS, '*'))
+    
+    results = {k: [] for k in SMART_CONFIG.keys()}
+    
+    for doc_dir in doc_folders:
+        if not os.path.isdir(doc_dir): continue
+        
+        folder_name = os.path.basename(doc_dir) # e.g., "CMS1500_File1"
+        print(f"Analyzing: {folder_name}...")
+        
+        # 1. DETECT FORM TYPE FROM FOLDER NAME
+        # Splitting "CMS1500_File1" -> ["CMS1500", "File1"]
+        parts = folder_name.split('_', 1)
+        if len(parts) < 2: 
+            print("   -> Skipping: Invalid Folder Name Format")
+            continue
+            
+        form_type = parts[0]
+        actual_filename = parts[1]
+
+        if form_type not in SMART_CONFIG:
+            print(f"   -> Skipping: Unknown Type {form_type}")
+            continue
+
+        # 2. Setup Data Row
+        row_data = {"Filename": actual_filename, "Form_Type": form_type}
+        cfg = SMART_CONFIG[form_type]
+        
+        # 3. Process Each Region defined in Config
+        for r_key, params in cfg['Regions'].items():
+            instruction = params[4]
+            context = cfg['Correction_Context']
+            
+            # Look for the specific image inside the folder
+            crop_path = os.path.join(doc_dir, f"{r_key}.png")
+            
+            if os.path.exists(crop_path):
+                # We found the pre-cut image!
+                crop_img = cv2.imread(crop_path)
+                
+                # Send to AI
+                extracted_data = call_smart_agent(crop_img, instruction, context)
+                row_data.update(extracted_data)
+            else:
+                # Region image missing (maybe coords were 0 or crop failed)
+                pass
+
+        results[form_type].append(row_data)
+
+    # 4. Save Final Reports
+    for f_type, rows in results.items():
+        if rows:
+            fname = SMART_CONFIG[f_type]['Excel_Filename']
+            save_path = os.path.join(FOLDER_4_REPORT, fname)
+            save_excel(rows, save_path)
+            print(f"SAVED: {len(rows)} rows to {fname}")
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 if __name__ == "__main__":
-    main()
+    
+    # Run the Pipeline Phases Step-by-Step
+    # Comment out phases you have already finished!
+
+    # 1. Convert everything to PNG
+    run_phase_1_conversion(os.path.join(BASE_FOLDER, 'Input_Raw'))
+
+    # 2. Deskew, Classify, and Align
+    run_phase_2_preprocessing()
+
+    # 3. Cut Region Images into Folders (e.g. "CMS1500_FileA")
+    run_phase_3_region_cropping()
+
+    # 4. Send Crops to AI and Build Excel
+    run_phase_4_extraction()
