@@ -1,24 +1,12 @@
-import pandas as pd
-import re
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment
-
-# --- 1. LOGIC FUNCTIONS ---
-
 def run_complex_rate_logic(xls, sheet_name):
-    """
-    Scans for 'Facility Name', extracts methodology, and parses PPO/HMO rates via Regex.
-    Returns a processed DataFrame.
-    """
     clean_data = []
-    
-    # A. FIND HEADER ROW (Scanning for 'Facility Name')
     try:
-        df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=20)
+        # 1. FIND HEADER ROW
+        df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=30)
         
         header_idx = 0
         found_header = False
+        
         for idx, row in df_raw.iterrows():
             row_str = ' '.join(row.astype(str)).lower()
             if "facility name" in row_str:
@@ -27,33 +15,33 @@ def run_complex_rate_logic(xls, sheet_name):
                 break
         
         if not found_header:
-            return pd.DataFrame() # Return empty if header not found
+            return pd.read_excel(xls, sheet_name=sheet_name) 
 
-        # B. LOAD DATA & METHODOLOGY
+        # 2. LOAD METADATA (ROWS ABOVE HEADER)
+        meta_rows = []
+        if header_idx > 0:
+            start_row = max(0, header_idx - 4) 
+            meta_df = pd.read_excel(xls, sheet_name=sheet_name, header=None, 
+                                    skiprows=start_row, nrows=header_idx - start_row)
+            # Convert to list of lists for safe indexing
+            meta_rows = meta_df.values.tolist()
+
+        # 3. LOAD MAIN DATA
         df = pd.read_excel(xls, sheet_name=sheet_name, header=header_idx)
-        
-        # Methodology is 2 rows ABOVE the header
-        methodology_map = {}
-        if header_idx >= 2:
-            meta_row = pd.read_excel(xls, sheet_name=sheet_name, header=None, 
-                                   skiprows=header_idx-2, nrows=1).iloc[0]
-            for i, col_name in enumerate(df.columns):
-                if i < len(meta_row):
-                    methodology_map[col_name] = meta_row[i]
-
-        # C. IDENTIFY COLUMNS
         df.columns = df.columns.astype(str).str.strip()
+
+        # 4. IDENTIFY COLUMNS
         static_keywords = ['facility', 'tin', 'city', 'market']
         static_cols = []
-        date_cols = []
+        data_cols = []
         
         for col in df.columns:
             if any(k in col.lower() for k in static_keywords):
                 static_cols.append(col)
             else:
-                date_cols.append(col)
+                data_cols.append(col)
 
-        # D. EXTRACT & CLEAN ROWS
+        # 5. PROCESS ROW BY ROW
         for idx, row in df.iterrows():
             fac_col = next((c for c in static_cols if 'facility' in c.lower()), None)
             fac_name = row[fac_col] if fac_col else None
@@ -64,117 +52,87 @@ def run_complex_rate_logic(xls, sheet_name):
                 'Facility Name': fac_name,
                 'City': row.get(next((c for c in static_cols if 'city' in c.lower()), ''), ''),
                 'TIN': row.get(next((c for c in static_cols if 'tin' in c.lower()), ''), ''),
-                'LOB': 'Medicare', 
-                'RM': 'Unknown' 
+                'LOB': 'Medicare'
             }
             
-            for date_col in date_cols:
-                cell_value = row[date_col]
+            for col_name in data_cols:
+                cell_value = row[col_name]
                 if pd.isna(cell_value): continue
-                
-                # Clean Header
-                clean_date = str(date_col).split('\n')[0].replace('except if noted', '').strip()
-                
-                # Get Methodology
-                meth_val = methodology_map.get(date_col)
-                current_rm = meth_val if pd.notna(meth_val) else "Unknown"
 
-                # Parse Cell: PPO/HMO and Rate
-                str_val = str(cell_value)
-                matches = re.findall(r'(PPO|HMO)[:\s-]+([^\n\r]+)', str_val, re.IGNORECASE)
+                # --- FIND DATE & RM (Robust Indexing) ---
+                # Safe way to get integer index even if columns are duplicates
+                try:
+                    col_loc = df.columns.get_loc(col_name)
+                    # If multiple columns have same name, get_loc returns a slice or array
+                    # We take the first one to avoid "list indices must be int" error
+                    if isinstance(col_loc, slice):
+                        col_idx = col_loc.start
+                    elif isinstance(col_loc, np.ndarray) or isinstance(col_loc, list):
+                        col_idx = np.where(col_loc)[0][0] # First True index
+                    else:
+                        col_idx = int(col_loc)
+                except:
+                    col_idx = 0 # Fallback safety
+
+                found_date = "Unknown"
+                found_rm = "Unknown"
+
+                # Check rows ABOVE the header
+                if meta_rows:
+                    for m_row in reversed(meta_rows):
+                        try:
+                            val = str(m_row[col_idx]).strip()
+                        except: continue # Skip if index out of bounds
+
+                        if val == 'nan' or val == '': continue
+                        
+                        date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', val)
+                        if date_match:
+                            found_date = date_match.group(1)
+                        elif len(val) > 2 and "effective" not in val.lower(): 
+                            found_rm = val
+
+                if found_date == "Unknown":
+                    header_date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', str(col_name))
+                    if header_date_match:
+                        found_date = header_date_match.group(1)
+
+                # --- PARSE CELL VALUE (FIXED) ---
+                str_val = str(cell_value).strip()
                 
-                for plan, raw_rate in matches:
-                    clean_rate = raw_rate.replace('Medicare', '').replace('medicare', '').strip()
+                # 1. STRICT MATCH: Look for "PPO:" or "HMO:"
+                matches = re.findall(r'(PPO|HMO)\s*:\s*([^\n\r]+)', str_val, re.IGNORECASE)
+                
+                # 2. FALLBACK: If no PPO/HMO found, use "Standard"
+                if not matches:
+                    if str_val and str_val.lower() != 'nan':
+                        # Valid List of Tuples: [ (Plan, Rate) ]
+                        matches = [('Standard', str_val)]
+
+                # 3. Create Rows (Safe Unpacking)
+                for item in matches:
+                    # SAFETY: Ensure we have exactly 2 items to unpack
+                    if len(item) != 2: 
+                        continue
+
+                    plan, raw_rate = item
+                    clean_rate = str(raw_rate).replace('Medicare', '').replace('medicare', '').strip()
                     
                     new_row = base_info.copy()
-                    new_row['RM'] = current_rm
-                    new_row['Effective Date'] = clean_date
-                    new_row['Plan'] = plan.upper()
+                    new_row['RM'] = found_rm
+                    new_row['Effective Date'] = found_date
+                    new_row['Plan'] = str(plan).upper()
                     new_row['Rate'] = clean_rate
                     clean_data.append(new_row)
 
-        # E. CREATE DATAFRAME
         if clean_data:
             final_df = pd.DataFrame(clean_data)
-            desired_order = ['Facility Name', 'City', 'TIN', 'LOB', 'RM', 'Effective Date', 'Plan', 'Rate']
-            # Reindex handling missing columns safely
-            final_df = final_df.reindex(columns=desired_order)
-            return final_df
+            desired = ['Facility Name', 'City', 'TIN', 'LOB', 'RM', 'Effective Date', 'Plan', 'Rate']
+            exist_cols = [c for c in desired if c in final_df.columns]
+            return final_df[exist_cols]
         else:
-            return pd.DataFrame()
+            return pd.read_excel(xls, sheet_name=sheet_name)
 
     except Exception as e:
-        print(f"Error in custom logic: {e}")
-        return pd.DataFrame()
-
-# --- 2. FORMATTING HELPER ---
-
-def format_worksheet(worksheet, sheet_name):
-    """
-    Converts data to an Excel Table, auto-adjusts width, and enables text wrapping.
-    """
-    max_row = worksheet.max_row
-    max_col = worksheet.max_column
-    
-    if max_row < 2: return # Skip empty sheets
-
-    ref = f"A1:{get_column_letter(max_col)}{max_row}"
-    clean_name = sheet_name.replace(" ", "_").replace("-", "_")
-    
-    # Ensure unique table name if needed, usually sheet name is unique enough
-    tab = Table(displayName=f"Table_{clean_name}", ref=ref)
-    style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
-                           showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-    tab.tableStyleInfo = style
-    worksheet.add_table(tab)
-
-    for i, column in enumerate(worksheet.columns):
-        column_letter = get_column_letter(i + 1)
-        max_length = 0
-        for cell in column:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except: pass
-            cell.alignment = Alignment(wrap_text=True, vertical='center')
-
-        adjusted_width = min(max_length + 2, 50) 
-        worksheet.column_dimensions[column_letter].width = adjusted_width
-
-# --- 3. MAIN EXECUTION ---
-
-INPUT_FILE = 'Master_Rates.xlsx'
-OUTPUT_FILE = 'Final_Output.xlsx'
-
-xls = pd.ExcelFile(INPUT_FILE)
-
-with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
-    
-    for sheet_name in xls.sheet_names:
-        
-        # Default read (overwritten if specific logic applies)
-        df = pd.read_excel(xls, sheet_name=sheet_name)
-        
-        n = sheet_name
-        
-        # --- LOGIC SWITCH ---
-        if n == 'Sheet1': 
-            # Replace 'Sheet1' with the actual sheet name you want to process with the complex logic
-            df = run_complex_rate_logic(xls, sheet_name)
-            
-        elif n == 'Another_Sheet_Name':
-            # Add next logic here
-            pass
-        # --------------------
-
-        # If data exists, write it
-        if not df.empty:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-            # Formatting
-            worksheet = writer.sheets[sheet_name]
-            format_worksheet(worksheet, sheet_name)
-        else:
-            print(f"Skipping empty or failed sheet: {sheet_name}")
-
-print(f"Done. Saved to {OUTPUT_FILE}")
+        print(f"Error in logic for {sheet_name}: {e}")
+        return pd.read_excel(xls, sheet_name=sheet_name)
