@@ -1,138 +1,145 @@
-def run_complex_rate_logic(xls, sheet_name):
-    clean_data = []
-    try:
-        # 1. FIND HEADER ROW
-        df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=30)
-        
-        header_idx = 0
-        found_header = False
-        
-        for idx, row in df_raw.iterrows():
-            row_str = ' '.join(row.astype(str)).lower()
-            if "facility name" in row_str:
-                header_idx = idx
-                found_header = True
-                break
-        
-        if not found_header:
-            return pd.read_excel(xls, sheet_name=sheet_name) 
+import os
+import re
+import cv2
+import shutil
+import numpy as np
+import pandas as pd
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_path
+from docx import Document
+from scipy.ndimage import rotate
+from datetime import datetime
+from openpyxl import load_workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
-        # 2. LOAD METADATA (ROWS ABOVE HEADER)
-        meta_rows = []
-        if header_idx > 0:
-            start_row = max(0, header_idx - 4) 
-            meta_df = pd.read_excel(xls, sheet_name=sheet_name, header=None, 
-                                    skiprows=start_row, nrows=header_idx - start_row)
-            # Convert to list of lists for safe indexing
-            meta_rows = meta_df.values.tolist()
+# --- CONFIGURATION ---
+TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe' 
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
-        # 3. LOAD MAIN DATA
-        df = pd.read_excel(xls, sheet_name=sheet_name, header=header_idx)
-        df.columns = df.columns.astype(str).str.strip()
+INPUT_FOLDER = './input_docs'
+TEXT_OUTPUT_FOLDER = './converted_text'
+FINAL_EXCEL_PATH = 'Split_Bill_Extraction_Report.xlsx'
+EXT_ID = "SIV0592"
 
-        # 4. IDENTIFY COLUMNS
-        static_keywords = ['facility', 'tin', 'city', 'market']
-        static_cols = []
-        data_cols = []
-        
-        for col in df.columns:
-            if any(k in col.lower() for k in static_keywords):
-                static_cols.append(col)
-            else:
-                data_cols.append(col)
+# --- DESKEWING LOGIC ---
+def deskew_page(page_images_path, temp_folder):
+    deskewed_folder = os.path.join(temp_folder, "deskewed_images")
+    os.makedirs(deskewed_folder, exist_ok=True)
+    image_files = sorted([f for f in os.listdir(page_images_path) if f.lower().endswith('.png')])
+    
+    for filename in image_files:
+        input_path = os.path.join(page_images_path, filename)
+        image = cv2.imread(input_path)
+        if image is not None:
+            h, w = image.shape[:2]
+            scale = 800 / w
+            small_image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small_image, cv2.COLOR_BGR2GRAY)
+            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+            scores = []
+            angles = np.arange(-5, 5.1, 0.1)
+            for angle in angles:
+                rotated = rotate(thresh, angle, reshape=False, order=0)
+                projection = np.sum(rotated, axis=1)
+                scores.append(np.var(projection))
+            best_angle = angles[np.argmax(scores)]
+            M = cv2.getRotationMatrix2D((w // 2, h // 2), best_angle, 1.0)
+            deskewed_image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, 
+                                           borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+            cv2.imwrite(os.path.join(deskewed_folder, filename), deskewed_image)
+    return deskewed_folder
 
-        # 5. PROCESS ROW BY ROW
-        for idx, row in df.iterrows():
-            fac_col = next((c for c in static_cols if 'facility' in c.lower()), None)
-            fac_name = row[fac_col] if fac_col else None
+# --- PHASE 1: CONVERSION ---
+def convert_to_text():
+    print("PHASE 1: Converting files to .txt...")
+    if not os.path.exists(TEXT_OUTPUT_FOLDER): os.makedirs(TEXT_OUTPUT_FOLDER)
 
-            if pd.isna(fac_name): continue
-
-            base_info = {
-                'Facility Name': fac_name,
-                'City': row.get(next((c for c in static_cols if 'city' in c.lower()), ''), ''),
-                'TIN': row.get(next((c for c in static_cols if 'tin' in c.lower()), ''), ''),
-                'LOB': 'Medicare'
-            }
+    for root, _, files in os.walk(INPUT_FOLDER):
+        for file in files:
+            file_path = os.path.join(root, file)
+            ext = file.lower().split('.')[-1]
+            output_txt_path = os.path.join(TEXT_OUTPUT_FOLDER, f"{file}.txt")
+            if os.path.exists(output_txt_path): continue
             
-            for col_name in data_cols:
-                cell_value = row[col_name]
-                if pd.isna(cell_value): continue
+            text_content = ""
+            try:
+                if ext == 'pdf':
+                    images = convert_from_path(file_path)
+                    temp_img_dir = "temp_pages"
+                    os.makedirs(temp_img_dir, exist_ok=True)
+                    for i, img in enumerate(images): img.save(os.path.join(temp_img_dir, f"p_{i}.png"), "PNG")
+                    deskewed_dir = deskew_page(temp_img_dir, "temp_work")
+                    for img_f in sorted(os.listdir(deskewed_dir)):
+                        text_content += pytesseract.image_to_string(Image.open(os.path.join(deskewed_dir, img_f))) + "\n"
+                    shutil.rmtree(temp_img_dir)
+                    if os.path.exists("temp_work"): shutil.rmtree("temp_work")
+                elif ext == 'docx':
+                    text_content = "\n".join([p.text for p in Document(file_path).paragraphs])
+                elif ext in ['xlsx', 'xls']:
+                    text_content = pd.read_excel(file_path).to_string()
+                elif ext == 'txt':
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f: text_content = f.read()
 
-                # --- FIND DATE & RM (Robust Indexing) ---
-                # Safe way to get integer index even if columns are duplicates
-                try:
-                    col_loc = df.columns.get_loc(col_name)
-                    # If multiple columns have same name, get_loc returns a slice or array
-                    # We take the first one to avoid "list indices must be int" error
-                    if isinstance(col_loc, slice):
-                        col_idx = col_loc.start
-                    elif isinstance(col_loc, np.ndarray) or isinstance(col_loc, list):
-                        col_idx = np.where(col_loc)[0][0] # First True index
-                    else:
-                        col_idx = int(col_loc)
-                except:
-                    col_idx = 0 # Fallback safety
+                with open(output_txt_path, 'w', encoding='utf-8') as f: f.write(text_content)
+                print(f"Successfully converted: {file}")
+            except Exception as e: print(f"Error converting {file}: {e}")
 
-                found_date = "Unknown"
-                found_rm = "Unknown"
+# --- PHASE 2: EXTRACTION & EXCEL FORMATTING ---
+def format_excel_table(file_path):
+    wb = load_workbook(file_path)
+    ws = wb.active
+    if ws.max_row > 1:
+        tab = Table(displayName="ExtractionTable", ref=f"A1:{chr(64 + ws.max_column)}{ws.max_row}")
+        tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+        ws.add_table(tab)
+    for col in ws.columns:
+        max_length = 0
+        for cell in col:
+            if cell.value: max_length = max(max_length, len(str(cell.value)))
+        ws.column_dimensions[col[0].column_letter].width = min(max_length + 2, 70)
+    wb.save(file_path)
 
-                # Check rows ABOVE the header
-                if meta_rows:
-                    for m_row in reversed(meta_rows):
-                        try:
-                            val = str(m_row[col_idx]).strip()
-                        except: continue # Skip if index out of bounds
+def run_extraction():
+    print("PHASE 2: Running Regex Extraction...")
+    results = []
+    # REGEX: Captures from the start of the string or last full stop, 
+    # through the keyword, up to the next full stop.
+    regex_pattern = r"(?:^|(?<=[.!?]))\s*([^.!?]*?FOR THE SAME ILLNESS OR INJURY[^.!?]*?[.!?])"
 
-                        if val == 'nan' or val == '': continue
-                        
-                        date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', val)
-                        if date_match:
-                            found_date = date_match.group(1)
-                        elif len(val) > 2 and "effective" not in val.lower(): 
-                            found_rm = val
+    for txt_file in os.listdir(TEXT_OUTPUT_FOLDER):
+        cis_id = (re.search(r'(\d{6})', txt_file) or [None, "N/A"])[1]
+        file_ext = txt_file.split('.')[-2]
+        
+        with open(os.path.join(TEXT_OUTPUT_FOLDER, txt_file), 'r', encoding='utf-8') as f:
+            content = " ".join(f.read().split()) # Clean whitespace/newlines
+            matches = re.findall(regex_pattern, content, re.IGNORECASE)
+            
+            if matches:
+                for match in matches:
+                    results.append({
+                        'File_name': txt_file.replace('.txt', ''),
+                        'File_ext': file_ext,
+                        'CIS_ID': cis_id,
+                        'Lang_Ind': 1,
+                        'Lang': match.strip(),
+                        'EXT_ID': EXT_ID,
+                        'EXT_Date_Time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+            else:
+                results.append({
+                    'File_name': txt_file.replace('.txt', ''), 'File_ext': file_ext,
+                    'CIS_ID': cis_id, 'Lang_Ind': 0, 'Lang': "N/A",
+                    'EXT_ID': EXT_ID, 'EXT_Date_Time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
 
-                if found_date == "Unknown":
-                    header_date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', str(col_name))
-                    if header_date_match:
-                        found_date = header_date_match.group(1)
+    pd.DataFrame(results).to_excel(FINAL_EXCEL_PATH, index=False)
+    format_excel_table(FINAL_EXCEL_PATH)
+    print(f"Process complete. Output saved to: {FINAL_EXCEL_PATH}")
 
-                # --- PARSE CELL VALUE (FIXED) ---
-                str_val = str(cell_value).strip()
-                
-                # 1. STRICT MATCH: Look for "PPO:" or "HMO:"
-                matches = re.findall(r'(PPO|HMO)\s*:\s*([^\n\r]+)', str_val, re.IGNORECASE)
-                
-                # 2. FALLBACK: If no PPO/HMO found, use "Standard"
-                if not matches:
-                    if str_val and str_val.lower() != 'nan':
-                        # Valid List of Tuples: [ (Plan, Rate) ]
-                        matches = [('Standard', str_val)]
+def main():
+    convert_to_text() # Phase 1
+    run_extraction()  # Phase 2
 
-                # 3. Create Rows (Safe Unpacking)
-                for item in matches:
-                    # SAFETY: Ensure we have exactly 2 items to unpack
-                    if len(item) != 2: 
-                        continue
-
-                    plan, raw_rate = item
-                    clean_rate = str(raw_rate).replace('Medicare', '').replace('medicare', '').strip()
-                    
-                    new_row = base_info.copy()
-                    new_row['RM'] = found_rm
-                    new_row['Effective Date'] = found_date
-                    new_row['Plan'] = str(plan).upper()
-                    new_row['Rate'] = clean_rate
-                    clean_data.append(new_row)
-
-        if clean_data:
-            final_df = pd.DataFrame(clean_data)
-            desired = ['Facility Name', 'City', 'TIN', 'LOB', 'RM', 'Effective Date', 'Plan', 'Rate']
-            exist_cols = [c for c in desired if c in final_df.columns]
-            return final_df[exist_cols]
-        else:
-            return pd.read_excel(xls, sheet_name=sheet_name)
-
-    except Exception as e:
-        print(f"Error in logic for {sheet_name}: {e}")
-        return pd.read_excel(xls, sheet_name=sheet_name)
+if __name__ == "__main__":
+    main()
