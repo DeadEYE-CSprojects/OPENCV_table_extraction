@@ -1,145 +1,482 @@
 import os
+import shutil
+import pandas as pd
 import re
 import cv2
-import shutil
 import numpy as np
-import pandas as pd
 import pytesseract
-from PIL import Image
+import subprocess
+import json
+import fitz  # PyMuPDF
 from pdf2image import convert_from_path
-from docx import Document
-from scipy.ndimage import rotate
-from datetime import datetime
-from openpyxl import load_workbook
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from openai import OpenAI
+import openpyxl
+from docx2pdf import convert as docx_to_pdf_convert
+from PIL import Image
+import time
+import base64
 
-# --- CONFIGURATION ---
-TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe' 
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+# ==========================================
+# 1. CONFIGURATION & CONSTANTS
+# ==========================================
 
-INPUT_FOLDER = './input_docs'
-TEXT_OUTPUT_FOLDER = './converted_text'
-FINAL_EXCEL_PATH = 'Split_Bill_Extraction_Report.xlsx'
-EXT_ID = "SIV0592"
+# --- CONTROL SWITCH ---
+# Set to FALSE: The script will ONLY convert files to .txt and stop.
+# Set to TRUE: The script will run the 'contract_type.py' analysis after conversion.
+RUN_CONTRACT_SCRIPT = False
 
-# --- DESKEWING LOGIC ---
-def deskew_page(page_images_path, temp_folder):
-    deskewed_folder = os.path.join(temp_folder, "deskewed_images")
-    os.makedirs(deskewed_folder, exist_ok=True)
-    image_files = sorted([f for f in os.listdir(page_images_path) if f.lower().endswith('.png')])
+# API SETUP
+# Replace "YOUR_OPENAI_API_KEY_HERE" with your actual key if not using env variables
+API_KEY = "YOUR_OPENAI_API_KEY_HERE"
+client = OpenAI(api_key=API_KEY)
+
+# IMAGE QUALITY SETTINGS
+# 500 DPI is significantly higher than standard (200) to ensure small text is clear for OCR.
+PDF_CONVERSION_DPI = 500      
+# If an image width is below 2500px, we will upscale it before sending to LLM.
+MIN_IMAGE_WIDTH = 2500        
+
+# DIRECTORY PATHS
+INPUT_FILES_PATH = "./input_files/"
+TXT_OUTPUT_PATH = "./txt_output/"       # Folder where finalized .txt files are saved
+FUTURE_EXCEL_PATH = "./final_output/"   # Reserved folder for Phase 2 output
+CONTRACT_SCRIPTS_PATH = "./contract_scripts/"
+
+# FILE NAMES
+TOKEN_CALC_PATH = "token_calculation.xlsx"
+PROCESS_LOG_PATH = "process_log.txt"
+
+# KNOWN CONTRACT TYPES (Used for LLM Classification)
+CONTRACT_TYPES_LIST = [
+    "home_health", "skilled_nursing", "aec", "asc", "detox", "dialysis", 
+    "hca", "hospice", "psych", "rehab", "tenet", "prosthetics", "drg", 
+    "cah", "rhc", "dme", "anesthesia", "chv", "surgery", "telemedicine", "audiology"
+]
+
+# TESSERACT CONFIG
+# If you are on Windows, you might need to uncomment and set the path below:
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# CREATE DIRECTORIES IF THEY DO NOT EXIST
+os.makedirs(INPUT_FILES_PATH, exist_ok=True)
+os.makedirs(TXT_OUTPUT_PATH, exist_ok=True)
+os.makedirs(CONTRACT_SCRIPTS_PATH, exist_ok=True)
+os.makedirs(FUTURE_EXCEL_PATH, exist_ok=True)
+
+# ==========================================
+# 2. HELPER FUNCTIONS
+# ==========================================
+
+def get_cis_id(filename):
+    """
+    Extracts the first complete numeric string of at least 4 digits from the filename.
+    Returns "UNKNOWN" if no ID is found.
+    """
+    match = re.search(r'\d{4,}', filename)
+    return match.group(0) if match else "UNKNOWN"
+
+def deskew_image(pil_image):
+    """
+    Corrects slight tilts in images (0.1 - 1.0 degrees) which can confuse OCR.
+    Uses OpenCV to find text contours and rotate the image to be perfectly horizontal.
+    """
+    img = np.array(pil_image)
     
-    for filename in image_files:
-        input_path = os.path.join(page_images_path, filename)
-        image = cv2.imread(input_path)
-        if image is not None:
-            h, w = image.shape[:2]
-            scale = 800 / w
-            small_image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small_image, cv2.COLOR_BGR2GRAY)
-            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-            scores = []
-            angles = np.arange(-5, 5.1, 0.1)
-            for angle in angles:
-                rotated = rotate(thresh, angle, reshape=False, order=0)
-                projection = np.sum(rotated, axis=1)
-                scores.append(np.var(projection))
-            best_angle = angles[np.argmax(scores)]
-            M = cv2.getRotationMatrix2D((w // 2, h // 2), best_angle, 1.0)
-            deskewed_image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, 
-                                           borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-            cv2.imwrite(os.path.join(deskewed_folder, filename), deskewed_image)
-    return deskewed_folder
+    # Convert image to BGR format for OpenCV
+    if len(img.shape) == 2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4: img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    else: img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-# --- PHASE 1: CONVERSION ---
-def convert_to_text():
-    print("PHASE 1: Converting files to .txt...")
-    if not os.path.exists(TEXT_OUTPUT_FOLDER): os.makedirs(TEXT_OUTPUT_FOLDER)
+    # Convert to grayscale and invert (text becomes white, background black)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    
+    # Threshold to isolate text pixels
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    
+    # If no text found, return original
+    if len(coords) == 0: return pil_image
 
-    for root, _, files in os.walk(INPUT_FOLDER):
-        for file in files:
-            file_path = os.path.join(root, file)
-            ext = file.lower().split('.')[-1]
-            output_txt_path = os.path.join(TEXT_OUTPUT_FOLDER, f"{file}.txt")
-            if os.path.exists(output_txt_path): continue
-            
-            text_content = ""
-            try:
-                if ext == 'pdf':
-                    images = convert_from_path(file_path)
-                    temp_img_dir = "temp_pages"
-                    os.makedirs(temp_img_dir, exist_ok=True)
-                    for i, img in enumerate(images): img.save(os.path.join(temp_img_dir, f"p_{i}.png"), "PNG")
-                    deskewed_dir = deskew_page(temp_img_dir, "temp_work")
-                    for img_f in sorted(os.listdir(deskewed_dir)):
-                        text_content += pytesseract.image_to_string(Image.open(os.path.join(deskewed_dir, img_f))) + "\n"
-                    shutil.rmtree(temp_img_dir)
-                    if os.path.exists("temp_work"): shutil.rmtree("temp_work")
-                elif ext == 'docx':
-                    text_content = "\n".join([p.text for p in Document(file_path).paragraphs])
-                elif ext in ['xlsx', 'xls']:
-                    text_content = pd.read_excel(file_path).to_string()
-                elif ext == 'txt':
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f: text_content = f.read()
+    # Calculate the angle of the text block
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45: angle = -(90 + angle)
+    else: angle = -angle
 
-                with open(output_txt_path, 'w', encoding='utf-8') as f: f.write(text_content)
-                print(f"Successfully converted: {file}")
-            except Exception as e: print(f"Error converting {file}: {e}")
+    # Rotate the image to correct the skew
+    (h, w) = img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    return Image.fromarray(cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB))
 
-# --- PHASE 2: EXTRACTION & EXCEL FORMATTING ---
-def format_excel_table(file_path):
-    wb = load_workbook(file_path)
-    ws = wb.active
-    if ws.max_row > 1:
-        tab = Table(displayName="ExtractionTable", ref=f"A1:{chr(64 + ws.max_column)}{ws.max_row}")
-        tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
-        ws.add_table(tab)
-    for col in ws.columns:
-        max_length = 0
-        for cell in col:
-            if cell.value: max_length = max(max_length, len(str(cell.value)))
-        ws.column_dimensions[col[0].column_letter].width = min(max_length + 2, 70)
-    wb.save(file_path)
+def enhance_and_upscale(pil_image):
+    """
+    Prepares an image for High-Accuracy OCR.
+    1. Checks if resolution is too low (< 2500px width). If so, upscales it.
+    2. Applies a sharpening filter to make text edges crisp.
+    """
+    img = np.array(pil_image)
+    
+    # 1. Smart Upscale using Cubic Interpolation
+    height, width = img.shape[:2]
+    if width < MIN_IMAGE_WIDTH:
+        scale_factor = MIN_IMAGE_WIDTH / width
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
 
-def run_extraction():
-    print("PHASE 2: Running Regex Extraction...")
-    results = []
-    # REGEX: Captures from the start of the string or last full stop, 
-    # through the keyword, up to the next full stop.
-    regex_pattern = r"(?:^|(?<=[.!?]))\s*([^.!?]*?FOR THE SAME ILLNESS OR INJURY[^.!?]*?[.!?])"
+    # 2. Apply Sharpening Kernel
+    kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
+    enhanced = cv2.filter2D(img, -1, kernel)
+    
+    return Image.fromarray(enhanced)
 
-    for txt_file in os.listdir(TEXT_OUTPUT_FOLDER):
-        cis_id = (re.search(r'(\d{6})', txt_file) or [None, "N/A"])[1]
-        file_ext = txt_file.split('.')[-2]
+def encode_image_base64(image_path):
+    """
+    Reads an image file from disk and returns a Base64 encoded string.
+    Required for sending images to OpenAI API.
+    """
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def check_page_complexity(image_path):
+    """
+    Uses GPT-4o Vision to visually inspect the page.
+    Returns True if it contains complex elements (Tables, Forms, Diagrams).
+    Also returns the token cost of this check.
+    """
+    base64_img = encode_image_base64(image_path)
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Does this page contain a data table, form grid, or significant diagram? Answer YES or NO."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_img}"}}
+                ]
+            }],
+            max_tokens=15
+        )
+        answer = response.choices[0].message.content.strip().upper()
+        return "YES" in answer, response.usage.total_tokens
+    except Exception as e:
+        print(f"      [Warning] Complexity Check Failed: {e}")
+        return False, 0
+
+def llm_convert_to_text(pil_image):
+    """
+    Transcribes a High-Resolution image using GPT-4o.
+    Saves image as PNG (Lossless) first to ensure no compression artifacts.
+    """
+    # Save as PNG to preserve the 500 DPI quality we generated earlier
+    temp_path = "temp_llm_input.png"
+    pil_image.save(temp_path, format="PNG") 
+    
+    base64_img = encode_image_base64(temp_path)
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert OCR engine. Transcribe the text from this high-resolution image exactly. Preserve all table structures using markdown. Do not summarize."},
+                {"role": "user", "content": [{"type": "text", "text": "Transcribe this image."}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_img}", "detail": "high"}}]}
+            ],
+        )
+        content = response.choices[0].message.content
+        tokens = response.usage.total_tokens
         
-        with open(os.path.join(TEXT_OUTPUT_FOLDER, txt_file), 'r', encoding='utf-8') as f:
-            content = " ".join(f.read().split()) # Clean whitespace/newlines
-            matches = re.findall(regex_pattern, content, re.IGNORECASE)
+        # Cleanup temp file
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return content, tokens
+    except Exception as e:
+        print(f"      [Error] LLM Conversion Failed: {e}")
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return "", 0
+
+def log_token_usage_excel(filename, phase1, phase2=0):
+    """
+    Appends token usage row-by-row to the Excel file.
+    This ensures that if the script crashes, we don't lose the cost data for previous files.
+    """
+    new_data = pd.DataFrame([[filename, phase1, phase2]], columns=["filename", "phase1_token", "phase2_tokens"])
+    try:
+        if not os.path.exists(TOKEN_CALC_PATH):
+            new_data.to_excel(TOKEN_CALC_PATH, index=False)
+        else:
+            # Append to existing Excel sheet
+            with pd.ExcelWriter(TOKEN_CALC_PATH, mode='a', engine='openpyxl', if_sheet_exists='overlay') as writer:
+                if writer.book.worksheets:
+                    start_row = writer.book.active.max_row
+                    new_data.to_excel(writer, index=False, header=False, startrow=start_row)
+                else:
+                    new_data.to_excel(writer, index=False)
+    except Exception as e:
+        print(f"      [Warning] Could not log tokens: {e}")
+
+def determine_contract_type(text_content):
+    """
+    Analyzes the text content (First 4k chars + Last 2k chars) to identify the contract type.
+    """
+    context = text_content[:4000] + "\n...\n" + text_content[-2000:]
+    prompt = f"Analyze and classify into one of: {json.dumps(CONTRACT_TYPES_LIST)}. If unsure, return 'others'."
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Return only the category name."},
+                {"role": "user", "content": f"{prompt}\n\nTEXT:\n{context}"}
+            ]
+        )
+        ctype = response.choices[0].message.content.strip().lower()
+        # Verify result is in our allowed list
+        for t in CONTRACT_TYPES_LIST:
+            if t in ctype: return t
+        return "others"
+    except:
+        return "others"
+
+def log_process_status(message):
+    """Writes a simple log message to a text file with a timestamp."""
+    with open(PROCESS_LOG_PATH, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+
+# ==========================================
+# 3. MAIN WORKFLOW
+# ==========================================
+
+def process_pipeline(start_index=None, end_index=None):
+    if not os.path.exists(INPUT_FILES_PATH):
+        print(f"CRITICAL: Input directory {INPUT_FILES_PATH} does not exist.")
+        return
+
+    # 1. Get List of Files
+    input_files = [f for f in os.listdir(INPUT_FILES_PATH) if os.path.isfile(os.path.join(INPUT_FILES_PATH, f))]
+    
+    # 2. Create Inventory
+    inventory_data = []
+    for idx, f in enumerate(input_files):
+        inventory_data.append({
+            "Index": idx, "filename": f, "file_ext": os.path.splitext(f)[1].lower(),
+            "CIS ID": get_cis_id(f), "file_path": os.path.join(INPUT_FILES_PATH, f)
+        })
+    
+    df_inventory = pd.DataFrame(inventory_data)
+    
+    # Define Range
+    if start_index is None: start_index = 0
+    if end_index is None: end_index = len(df_inventory) - 1
+
+    print(f"--- Pipeline Started: Processing {len(inventory_data)} files (High-Res Mode) ---")
+    if not RUN_CONTRACT_SCRIPT:
+        print(">>> MODE: CONVERSION ONLY (Skipping Contract Scripts) <<<")
+
+    index = start_index
+
+    # 3. Loop Through Files
+    while index <= end_index:
+        try:
+            row = df_inventory.iloc[index]
+            f_name = row['filename']
+            f_path = row['file_path']
+            f_ext = row['file_ext']
+            cis_id = row['CIS ID']
             
-            if matches:
-                for match in matches:
-                    results.append({
-                        'File_name': txt_file.replace('.txt', ''),
-                        'File_ext': file_ext,
-                        'CIS_ID': cis_id,
-                        'Lang_Ind': 1,
-                        'Lang': match.strip(),
-                        'EXT_ID': EXT_ID,
-                        'EXT_Date_Time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
+            # Construct output name: filename_filetype.txt
+            clean_ext = f_ext.replace('.', '')
+            final_txt_name = f"{f_name}_{clean_ext}.txt"
+            final_txt_path = os.path.join(TXT_OUTPUT_PATH, final_txt_name)
+
+            print(f"\n[{index}] Processing: {f_name} (CIS: {cis_id})")
+
+            # --- A. SKIP CHECK ---
+            # If the .txt file already exists, we skip extraction and jump to Step 5
+            if os.path.exists(final_txt_path):
+                print(f"   -> Output found. Skipping extraction.")
+                with open(final_txt_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    txt_content = f.read()
+                goto_step_5(f_name, clean_ext, cis_id, txt_content, f_path, final_txt_path)
+                index += 1
+                continue
+
+            # --- B. FILE PROCESSING (Based on Type) ---
+            
+            # TYPE 1: SPREADSHEETS (Excel/CSV)
+            if f_ext in ['.xlsx', '.xls', '.csv']:
+                print("   -> Type: Spreadsheet")
+                content = ""
+                if f_ext == '.csv':
+                    content = pd.read_csv(f_path).to_string()
+                else:
+                    xls = pd.ExcelFile(f_path)
+                    for sheet in xls.sheet_names:
+                        content += f"##-- SHEET: {sheet} --##\n{pd.read_excel(xls, sheet_name=sheet).to_string()}\n"
+                
+                with open(final_txt_path, 'w', encoding='utf-8') as f: f.write(content)
+                goto_step_5(f_name, clean_ext, cis_id, content, f_path, final_txt_path)
+
+            # TYPE 2: PLAIN TEXT
+            elif f_ext == '.txt':
+                print("   -> Type: Text File")
+                shutil.copy(f_path, final_txt_path)
+                with open(final_txt_path, 'r', encoding='utf-8') as f: content = f.read()
+                goto_step_5(f_name, clean_ext, cis_id, content, f_path, final_txt_path)
+
+            # TYPE 3: COMPLEX DOCUMENTS (PDF, DOCX, IMAGES)
+            elif f_ext in ['.pdf', '.docx', '.tiff', '.tif', '.jpg', '.png', '.jpeg']:
+                print("   -> Type: Complex Document (High Res)")
+                temp_pdf_path = f_path
+                is_docx = (f_ext == '.docx')
+                
+                # Conversion: DOCX -> PDF
+                # (We do this to standardize image extraction using poppler/pdf2image)
+                if is_docx:
+                    print("      -> Converting DOCX to PDF...")
+                    temp_pdf_path = os.path.join(TXT_OUTPUT_PATH, f"temp_{cis_id}.pdf")
+                    docx_to_pdf_convert(f_path, temp_pdf_path)
+
+                images = []
+                
+                # Rasterize PDF to Images at High DPI (500)
+                if f_ext in ['.pdf', '.docx']:
+                    try: 
+                        print("      -> Rasterizing PDF at 500 DPI...")
+                        images = convert_from_path(temp_pdf_path, dpi=PDF_CONVERSION_DPI)
+                    except: pass
+                elif f_ext in ['.tiff', '.tif']:
+                    img = Image.open(f_path)
+                    for i in range(getattr(img, 'n_frames', 1)):
+                        img.seek(i)
+                        images.append(img.copy())
+                else:
+                    images = [Image.open(f_path)]
+
+                total_extracted_text = ""
+
+                # Loop through every page image
+                for i, pil_image in enumerate(images):
+                    page_num = i + 1
+                    print(f"      -> Page {page_num}/{len(images)}")
+                    
+                    # Save temporary image for Complexity Check
+                    temp_img_path = f"temp_page_{page_num}.png"
+                    pil_image.save(temp_img_path)
+                    
+                    # 1. Check Complexity (Table/Image?)
+                    is_complex, token_cost = check_page_complexity(temp_img_path)
+                    page_text = ""
+                    current_tokens = token_cost
+
+                    if is_complex:
+                        print("         -> Complex (LLM High-Res).")
+                        # Step A: Deskew
+                        deskewed = deskew_image(pil_image)
+                        # Step B: Smart Upscale & Sharpen
+                        final_img = enhance_and_upscale(deskewed)
+                        
+                        # Step C: Send to GPT-4o
+                        txt_llm, t_ocr = llm_convert_to_text(final_img)
+                        page_text = txt_llm
+                        current_tokens += t_ocr
+                        
+                        # Log cost immediately
+                        log_token_usage_excel(f_name, current_tokens, 0)
+                    else:
+                        print("         -> Simple (Digital/OCR).")
+                        digital_text = ""
+                        has_digital = False
+                        
+                        # Check if digital text is available (Fast & Free)
+                        target_pdf = temp_pdf_path if (is_docx or f_ext == '.pdf') else None
+                        
+                        if target_pdf and os.path.exists(target_pdf):
+                            try:
+                                with fitz.open(target_pdf) as doc:
+                                    if i < len(doc):
+                                        digital_text = doc[i].get_text()
+                                        if len(digital_text.strip()) > 15: has_digital = True
+                            except: pass
+
+                        if has_digital:
+                            page_text = digital_text
+                        else:
+                            # Fallback to Tesseract OCR (on the high-res image)
+                            page_text = pytesseract.image_to_string(pil_image)
+
+                    # Append extracted text
+                    formatted_page = f"\n##-- PAGE: {page_num} --##\n{page_text}\n"
+                    total_extracted_text += formatted_page
+                    
+                    # Write to file immediately (Safe against crashes)
+                    with open(final_txt_path, 'a', encoding='utf-8') as f: f.write(formatted_page)
+                    
+                    # Cleanup temp image
+                    if os.path.exists(temp_img_path): os.remove(temp_img_path)
+
+                # Cleanup temp PDF (if DOCX)
+                if is_docx and os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
+                
+                # Proceed to Finalize
+                goto_step_5(f_name, clean_ext, cis_id, total_extracted_text, f_path, final_txt_path)
+
             else:
-                results.append({
-                    'File_name': txt_file.replace('.txt', ''), 'File_ext': file_ext,
-                    'CIS_ID': cis_id, 'Lang_Ind': 0, 'Lang': "N/A",
-                    'EXT_ID': EXT_ID, 'EXT_Date_Time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                })
+                print(f"   [Skipped] Unknown file type: {f_ext}")
+                log_process_status(f"SKIPPED: {f_name}")
 
-    pd.DataFrame(results).to_excel(FINAL_EXCEL_PATH, index=False)
-    format_excel_table(FINAL_EXCEL_PATH)
-    print(f"Process complete. Output saved to: {FINAL_EXCEL_PATH}")
+            index += 1
 
-def main():
-    convert_to_text() # Phase 1
-    run_extraction()  # Phase 2
+        except Exception as e:
+            # --- ERROR HANDLING ---
+            # If an error occurs, log it and move to the next file. DO NOT HALT.
+            print(f"!!! ERROR on Index {index}: {e}")
+            log_process_status(f"ERROR: Index {index} - {str(e)}")
+            index += 1
+            time.sleep(1) # Brief pause to stabilize
+            continue
+
+def goto_step_5(filename, filetype, cis_id, text_content, original_path, txt_path):
+    """
+    Step 5: Finalize.
+    If RUN_CONTRACT_SCRIPT is False, it stops here.
+    If True, it identifies the contract type and runs the corresponding external script.
+    """
+    if not RUN_CONTRACT_SCRIPT:
+        print(f"   -> Conversion Complete. Saved to: {os.path.basename(txt_path)}")
+        log_process_status(f"CONVERTED ONLY: {filename}")
+        return
+    
+    print("   -> Step 5: Contract Analysis")
+    # Identify Type using LLM
+    ctype = determine_contract_type(text_content)
+    print(f"      -> Identified Type: {ctype}")
+    
+    # Locate Script
+    target_script = f"{ctype}.py"
+    script_full_path = os.path.join(CONTRACT_SCRIPTS_PATH, target_script)
+    
+    # Fallback to others.py if specific script missing
+    if not os.path.exists(script_full_path):
+        script_full_path = os.path.join(CONTRACT_SCRIPTS_PATH, "others.py")
+        ctype_arg = ctype 
+    else:
+        ctype_arg = ctype
+
+    # Execute Script
+    if os.path.exists(script_full_path):
+        try:
+            subprocess.run([
+                "python", script_full_path,
+                "--filename", filename, "--filetype", filetype, "--cis_id", str(cis_id),
+                "--contract_type", ctype_arg, "--file_path", original_path, "--txt_path", txt_path
+            ], check=True)
+            log_process_status(f"SUCCESS: {filename} processed as {ctype}")
+        except subprocess.CalledProcessError as e:
+            print(f"      [Error] Subprocess Failed: {e}")
+    else:
+        print("      [Error] 'others.py' is missing.")
 
 if __name__ == "__main__":
-    main()
+    process_pipeline()
