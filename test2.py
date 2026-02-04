@@ -15,6 +15,7 @@ from docx2pdf import convert as docx_to_pdf_convert
 from PIL import Image
 import time
 import base64
+import argparse
 
 # ==========================================
 # 1. CONFIGURATION & CONSTANTS
@@ -43,6 +44,7 @@ FUTURE_EXCEL_PATH = "./final_output/"   # Reserved folder for Phase 2 output
 CONTRACT_SCRIPTS_PATH = "./contract_scripts/"
 
 # FILE NAMES
+INVENTORY_FILE_PATH = "inventory.xlsx"  # The Master List for parallel processing
 TOKEN_CALC_PATH = "token_calculation.xlsx"
 PROCESS_LOG_PATH = "process_log.txt"
 
@@ -248,38 +250,74 @@ def log_process_status(message):
 # 3. MAIN WORKFLOW
 # ==========================================
 
+def get_or_create_inventory():
+    """
+    LOGIC FOR PARALLEL PROCESSING:
+    1. Check if 'inventory.xlsx' ALREADY exists.
+       - If YES: Load it strictly. DO NOT create a new one. This ensures all team members use the exact same Index list.
+    2. If NO: Scan input folder, create the Excel file, save it, and return it.
+    """
+    if os.path.exists(INVENTORY_FILE_PATH):
+        print(f"--- LOCKED: Found existing 'inventory.xlsx'. Loading Master List... ---")
+        return pd.read_excel(INVENTORY_FILE_PATH)
+    else:
+        print(f"--- INITIALIZING: Creating NEW 'inventory.xlsx' from {INPUT_FILES_PATH} ---")
+        if not os.path.exists(INPUT_FILES_PATH):
+            print(f"CRITICAL ERROR: Input directory {INPUT_FILES_PATH} missing.")
+            return pd.DataFrame() # Return empty DF
+
+        input_files = [f for f in os.listdir(INPUT_FILES_PATH) if os.path.isfile(os.path.join(INPUT_FILES_PATH, f))]
+        
+        # Sort files to ensure the initial creation is deterministic (alphabetical order)
+        input_files.sort()
+
+        inventory_data = []
+        for idx, f in enumerate(input_files):
+            inventory_data.append({
+                "Index": idx, 
+                "filename": f, 
+                "file_ext": os.path.splitext(f)[1].lower(),
+                "CIS ID": get_cis_id(f), 
+                "file_path": os.path.join(INPUT_FILES_PATH, f)
+            })
+        
+        df = pd.DataFrame(inventory_data)
+        df.to_excel(INVENTORY_FILE_PATH, index=False)
+        print(f"--- Inventory created with {len(df)} files. Saved to {INVENTORY_FILE_PATH} ---")
+        return df
+
 def process_pipeline(start_index=None, end_index=None):
-    if not os.path.exists(INPUT_FILES_PATH):
-        print(f"CRITICAL: Input directory {INPUT_FILES_PATH} does not exist.")
+    
+    # 1. Load Inventory (The Master List)
+    df_inventory = get_or_create_inventory()
+    
+    if df_inventory.empty:
+        print("No files to process. Exiting.")
         return
 
-    # 1. Get List of Files
-    input_files = [f for f in os.listdir(INPUT_FILES_PATH) if os.path.isfile(os.path.join(INPUT_FILES_PATH, f))]
-    
-    # 2. Create Inventory
-    inventory_data = []
-    for idx, f in enumerate(input_files):
-        inventory_data.append({
-            "Index": idx, "filename": f, "file_ext": os.path.splitext(f)[1].lower(),
-            "CIS ID": get_cis_id(f), "file_path": os.path.join(INPUT_FILES_PATH, f)
-        })
-    
-    df_inventory = pd.DataFrame(inventory_data)
-    
-    # Define Range
+    # 2. Determine Processing Range
+    # If no index provided, run everything.
     if start_index is None: start_index = 0
     if end_index is None: end_index = len(df_inventory) - 1
 
-    print(f"--- Pipeline Started: Processing {len(inventory_data)} files (High-Res Mode) ---")
+    # Bounds check
+    if start_index < 0: start_index = 0
+    if end_index >= len(df_inventory): end_index = len(df_inventory) - 1
+
+    print(f"--- Pipeline Started: Processing Index {start_index} to {end_index} (High-Res Mode) ---")
     if not RUN_CONTRACT_SCRIPT:
         print(">>> MODE: CONVERSION ONLY (Skipping Contract Scripts) <<<")
 
     index = start_index
 
-    # 3. Loop Through Files
+    # 3. Main Loop
     while index <= end_index:
         try:
+            # Access row by Index matching the 'inventory.xlsx' structure
             row = df_inventory.iloc[index]
+            
+            # Validation: Ensure we are processing the correct file for the index
+            # (Just in case the excel was sorted or modified, we trust the row data)
             f_name = row['filename']
             f_path = row['file_path']
             f_ext = row['file_ext']
@@ -304,6 +342,13 @@ def process_pipeline(start_index=None, end_index=None):
 
             # --- B. FILE PROCESSING (Based on Type) ---
             
+            # VALIDATION: Check if file physically exists
+            if not os.path.exists(f_path):
+                print(f"   -> ERROR: File not found on disk: {f_path}")
+                log_process_status(f"MISSING FILE: {f_name}")
+                index += 1
+                continue
+
             # TYPE 1: SPREADSHEETS (Excel/CSV)
             if f_ext in ['.xlsx', '.xls', '.csv']:
                 print("   -> Type: Spreadsheet")
@@ -332,7 +377,6 @@ def process_pipeline(start_index=None, end_index=None):
                 is_docx = (f_ext == '.docx')
                 
                 # Conversion: DOCX -> PDF
-                # (We do this to standardize image extraction using poppler/pdf2image)
                 if is_docx:
                     print("      -> Converting DOCX to PDF...")
                     temp_pdf_path = os.path.join(TXT_OUTPUT_PATH, f"temp_{cis_id}.pdf")
@@ -478,5 +522,17 @@ def goto_step_5(filename, filetype, cis_id, text_content, original_path, txt_pat
     else:
         print("      [Error] 'others.py' is missing.")
 
+# ==========================================
+# EXECUTION
+# ==========================================
 if __name__ == "__main__":
-    process_pipeline()
+    # ARGUMENT PARSING
+    # This allows you to run: "python script.py --start 0 --end 100"
+    parser = argparse.ArgumentParser(description="Medical Contract OCR Pipeline")
+    parser.add_argument("--start", type=int, default=None, help="Start Index (inclusive)")
+    parser.add_argument("--end", type=int, default=None, help="End Index (inclusive)")
+    
+    args = parser.parse_args()
+    
+    # Run the pipeline with provided arguments
+    process_pipeline(start_index=args.start, end_index=args.end)
