@@ -1,70 +1,65 @@
-import os
-import shutil
-import pandas as pd
-import re
-import cv2
-import numpy as np
-import pytesseract
-import subprocess
-import json
-import fitz  # PyMuPDF
-from pdf2image import convert_from_path
-from openai import OpenAI
-import openpyxl
-from docx2pdf import convert as docx_to_pdf_convert
-from PIL import Image
-import time
-import base64
-import argparse
-
-
-import pytesseract
-import shutil
-from PIL import Image, ImageDraw
-
-def check_pytesseract_ready():
-    print("--- Checking Pytesseract Configuration ---")
-
-    # 1. Check for the Tesseract Binary (System Level)
-    # This checks if 'apt-get install tesseract-ocr' worked
-    tesseract_path = shutil.which("tesseract")
+def log_token_usage_excel(filename, input_tokens_p1, output_tokens_p1, status=0):
+    excel_path = "inventory.xlsx"
     
-    if tesseract_path:
-        print(f"✅ [System] Tesseract binary found at: {tesseract_path}")
+    # --- PRICING CONSTANTS (Per Million) ---
+    PRICE_INPUT  = 2.12
+    PRICE_OUTPUT = 8.47
+    
+    # 1. Calculate Phase 1 Costs
+    ip_cost_p1 = (input_tokens_p1 / 1_000_000) * PRICE_INPUT
+    op_cost_p1 = (output_tokens_p1 / 1_000_000) * PRICE_OUTPUT
+    
+    # 2. Phase 2 Defaults (Set to 0 for now)
+    ip_tokens_p2 = 0
+    op_tokens_p2 = 0
+    ip_cost_p2   = 0.0
+    op_cost_p2   = 0.0
+    
+    # 3. Calculate Total Row Cost (P1 + P2)
+    total_row_cost = ip_cost_p1 + op_cost_p1 + ip_cost_p2 + op_cost_p2
+
+    # 4. Load or Create DataFrame
+    if os.path.exists(excel_path):
+        df = pd.read_excel(excel_path)
     else:
-        print("❌ [System] Tesseract binary NOT found.")
-        print("   -> Solution: Run '%sh apt-get update && apt-get install -y tesseract-ocr' in a separate cell.")
-        return False
+        # Create with specific column order if file doesn't exist
+        df = pd.DataFrame(columns=[
+            'filename', 
+            'ip_tokens_p1', 'ip_cost_p1', 'op_tokens_p1', 'op_cost_p1',
+            'ip_tokens_p2', 'ip_cost_p2', 'op_tokens_p2', 'op_cost_p2',
+            'Total_Cost', 'processed_flag'
+        ])
 
-    # 2. Check Python Binding & Version
-    try:
-        version = pytesseract.get_tesseract_version()
-        print(f"✅ [Python] Pytesseract connected. Engine Version: {version}")
-    except Exception as e:
-        print(f"❌ [Python] Error communicating with Tesseract: {e}")
-        return False
+    # 5. Ensure all columns exist (in case we run on an old Excel file)
+    required_cols = [
+        'ip_tokens_p1', 'ip_cost_p1', 'op_tokens_p1', 'op_cost_p1',
+        'ip_tokens_p2', 'ip_cost_p2', 'op_tokens_p2', 'op_cost_p2',
+        'Total_Cost'
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = 0.0
 
-    # 3. Test Actual OCR on a generated image
-    print("\n--- Running Functional OCR Test ---")
-    try:
-        # Create a simple white image with black text "OK"
-        img = Image.new('RGB', (60, 30), color=(255, 255, 255))
-        d = ImageDraw.Draw(img)
-        d.text((10, 10), "OK", fill=(0, 0, 0))
+    # 6. Update the specific row
+    mask = df['filename'] == filename
+    if mask.any():
+        # Update P1 Data
+        df.loc[mask, 'ip_tokens_p1'] = input_tokens_p1
+        df.loc[mask, 'ip_cost_p1']   = round(ip_cost_p1, 6)
+        df.loc[mask, 'op_tokens_p1'] = output_tokens_p1
+        df.loc[mask, 'op_cost_p1']   = round(op_cost_p1, 6)
         
-        # Perform OCR
-        # --psm 7 treats the image as a single text line (good for small test images)
-        text = pytesseract.image_to_string(img, config='--psm 7')
+        # Initialize P2 Data (Only if empty, to avoid overwriting future P2 runs)
+        # But since you said "keep as 0 for now", we ensure they are 0.
+        df.loc[mask, 'ip_tokens_p2'] = ip_tokens_p2
+        df.loc[mask, 'ip_cost_p2']   = ip_cost_p2
+        df.loc[mask, 'op_tokens_p2'] = op_tokens_p2
+        df.loc[mask, 'op_cost_p2']   = op_cost_p2
         
-        print(f"✅ [OCR Test] Engine output: '{text.strip()}'")
-        return True
+        # Update Grand Total
+        df.loc[mask, 'Total_Cost']   = round(total_row_cost, 6)
+        df.loc[mask, 'processed_flag'] = status
 
-    except Exception as e:
-        print(f"❌ [OCR Test] Failed to process image: {e}")
-        return False
-
-# Execute the check
-if check_pytesseract_ready():
-    print("\n🎉 SUCCESS: System is fully ready for OCR.")
-else:
-    print("\n🚫 FAILURE: System is not ready.")
+    # 7. Save
+    df.to_excel(excel_path, index=False)
+    print(f"      -> Logged Costs. P1 Total: ${round(ip_cost_p1 + op_cost_p1, 4)}")
