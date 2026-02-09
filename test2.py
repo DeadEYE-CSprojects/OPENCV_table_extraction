@@ -61,6 +61,12 @@ def log_token_usage_excel(filename, input_tokens_p1, output_tokens_p1, status=0)
         df.loc[mask, 'processed_flag'] = status
 
 
+    # 7. Save
+    df.to_excel(excel_path, index=False)
+    print(f"      -> Logged Costs. P1 Total: ${round(ip_cost_p1 + op_cost_p1, 4)}")
+
+
+
 
 import numpy as np
 import cv2
@@ -68,69 +74,118 @@ from PIL import Image
 
 def deskew_image(pil_image):
     """
-    Deskews an image using projection profiles (User's Verified Logic).
-    Wrapper handles PIL -> OpenCV -> PIL conversion.
+    ROBUST DESKEW: Handles Major (90/270) and Minor (±5) rotations.
+    
+    Logic:
+    1. Check Orientation: Are words 'wide' (Horizontal) or 'tall' (Vertical)?
+    2. Fix 90-degree rotations based on word shape.
+    3. Fine-tune the remaining tilt using Projection Profiles (Variance of text lines).
     """
     if pil_image is None: return None
     
-    # 1. Convert PIL (RGB) to OpenCV (BGR)
-    image = np.array(pil_image)
-    # Check if we need to convert color space
-    if len(image.shape) == 3 and image.shape[2] == 3:
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    elif len(image.shape) == 3 and image.shape[2] == 4:
-        image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-        
-    h, w = image.shape[:2]
-
-    # 2. Downscale for speed (Processing logic)
-    scale = 800 / max(h, w)
-    # Avoid upscaling if image is already small
-    if scale < 1:
-        small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    else:
-        small = image
-
-    # 3. Create Binary Threshold
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    print("\n   --- [Deskew] Starting Analysis ---")
+    
+    # 1. Convert PIL to OpenCV (BGR)
+    img = np.array(pil_image)
+    if len(img.shape) == 3:
+        if img.shape[2] == 4: img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        else: img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    
+    h_orig, w_orig = img.shape[:2]
+    
+    # 2. Create a Binary Map (Text = White, Background = Black)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Otsu's thresholding automatically finds the best ink separation
     thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    
+    # =========================================================
+    # STAGE 1: MACRO CORRECTION (Detect 0 vs 90 degrees)
+    # =========================================================
+    # We dilate (thicken) text to merge letters into "Word Blocks"
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    dilated = cv2.dilate(thresh, kernel, iterations=2)
+    
+    # Find contours of these blocks
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    aspect_ratios = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        # Filter noise: Box must be reasonable size
+        if w > 20 and h > 20: 
+            # Ratio > 1 means Tall (Vertical Text). Ratio < 1 means Wide (Horizontal).
+            aspect_ratios.append(h / w)
+            
+    # Calculate the median aspect ratio of all words on the page
+    if aspect_ratios:
+        median_ratio = np.median(aspect_ratios)
+    else:
+        median_ratio = 0.5 # Default to horizontal if empty
 
-    # 4. Find Best Angle using Projection
+    rotation_needed = 0
+    
+    # If Median Ratio > 1.2, words are standing up -> Page is Sideways
+    if median_ratio > 1.2:
+        print(f"   -> Detected VERTICAL text (Ratio: {median_ratio:.2f}). Rotating 90 deg.")
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        thresh = cv2.rotate(thresh, cv2.ROTATE_90_CLOCKWISE) # Update thresh for Stage 2
+        rotation_needed = 90
+    else:
+        print(f"   -> Detected HORIZONTAL text (Ratio: {median_ratio:.2f}). Keeping orientation.")
+
+    # =========================================================
+    # STAGE 2: MICRO CORRECTION (Projection Profile Method)
+    # =========================================================
+    # Now that we know it's roughly horizontal, we fix the wobble.
+    
+    print("   -> Calculating optimal projection angle...")
+    
+    h, w = img.shape[:2]
     scores = []
-    angles = np.arange(-5, 5.1, 0.5) # Steps of 0.5 are faster and usually sufficient
-
+    # Search range: -5 to +5 degrees
+    angles = np.arange(-5, 5.1, 0.5) 
+    
     for angle in angles:
-        # Rotate the tiny thresholded image
-        (h_s, w_s) = thresh.shape[:2]
-        center_s = (w_s // 2, h_s // 2)
-        M_s = cv2.getRotationMatrix2D(center_s, angle, 1.0)
-        rotated = cv2.warpAffine(thresh, M_s, (w_s, h_s), flags=cv2.INTER_NEAREST)
+        # Rotate ONLY the binary map (Fast)
+        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+        rotated_thresh = cv2.warpAffine(thresh, M, (w, h), flags=cv2.INTER_NEAREST)
         
-        # Calculate score (Variance of row sums)
-        # High variance = clear lines of text (white) vs background (black)
-        score = np.var(np.sum(rotated, axis=1))
+        # Calculate Row Variance (High Variance = Crisp Lines)
+        # Sum white pixels across rows
+        hist = np.sum(rotated_thresh, axis=1)
+        # Calculate how "spiky" the histogram is
+        score = np.sum((hist[1:] - hist[:-1]) ** 2)
         scores.append(score)
 
-    best_angle = angles[np.argmax(scores)]
-    print(f"      [Deskew] Best angle found: {best_angle:.2f}")
-
-    # 5. Apply to Original Image
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
+    # Find the angle with the sharpest text lines
+    best_micro_angle = angles[np.argmax(scores)]
+    print(f"   -> Best Fine-Tune Angle: {best_micro_angle:.2f} degrees")
     
-    # Use BORDER_CONSTANT with White (255,255,255) to fill corners
-    corrected = cv2.warpAffine(
-        image, 
-        M, 
-        (w, h), 
-        flags=cv2.INTER_CUBIC, 
-        borderMode=cv2.BORDER_CONSTANT, 
-        borderValue=(255, 255, 255)
-    )
+    # =========================================================
+    # STAGE 3: APPLY FINAL ROTATION
+    # =========================================================
     
-    # 6. Convert back to PIL (RGB)
-    return Image.fromarray(cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB))
+    # If we need to rotate (either Macro or Micro)
+    if rotation_needed != 0 or abs(best_micro_angle) > 0.1:
+        # Combined rotation is tricky, simpler to apply fine-tune to the current 'img'
+        # (Since 'img' might have already been rotated 90 in Stage 1)
+        
+        (h, w) = img.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, best_micro_angle, 1.0)
+        
+        # Warp with White Border (255,255,255) to prevent black corners
+        img = cv2.warpAffine(
+            img, 
+            M, 
+            (w, h), 
+            flags=cv2.INTER_CUBIC, 
+            borderMode=cv2.BORDER_CONSTANT, 
+            borderValue=(255, 255, 255)
+        )
+        print(f"   -> Applied Correction. Total Rotation: {rotation_needed + best_micro_angle:.2f}")
+    else:
+        print("   -> Image is already straight.")
 
-    # 7. Save
-    df.to_excel(excel_path, index=False)
-    print(f"      -> Logged Costs. P1 Total: ${round(ip_cost_p1 + op_cost_p1, 4)}")
+    # Convert back to PIL
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
