@@ -189,3 +189,24 @@ def deskew_image(pil_image):
 
     # Convert back to PIL
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+
+
+
+
+
+prompt = (
+    "Analyze the visual layout of this document page. "
+    "Determine if it is 'Complex' (requiring heavy processing) or 'Simple' (standard text).\n\n"
+    "Respond 'NO' (Simple) if the page contains:\n"
+    "- Standard paragraphs, articles, or reading text.\n"
+    "- Simple bulleted lists, numbered lists, or a Table of Contents.\n"
+    "- Basic headers, footers, or page numbers.\n"
+    "- A standard letter or memo format.\n"
+    "- 2-column text (like a research paper) WITHOUT data tables.\n\n"
+    "Respond 'YES' (Complex) ONLY if the page contains:\n"
+    "- A dense data table with strict rows/columns and numerical values.\n"
+    "- A form with input boxes, checkboxes, or significant handwriting.\n"
+    "- A layout with 3+ complex columns (like a newspaper or brochure).\n\n"
+    "Answer ONLY with 'YES' or 'NO'."
+)
