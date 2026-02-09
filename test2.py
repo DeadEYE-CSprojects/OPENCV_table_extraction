@@ -60,6 +60,77 @@ def log_token_usage_excel(filename, input_tokens_p1, output_tokens_p1, status=0)
         df.loc[mask, 'Total_Cost']   = round(total_row_cost, 6)
         df.loc[mask, 'processed_flag'] = status
 
+
+
+import numpy as np
+import cv2
+from PIL import Image
+
+def deskew_image(pil_image):
+    """
+    Deskews an image using projection profiles (User's Verified Logic).
+    Wrapper handles PIL -> OpenCV -> PIL conversion.
+    """
+    if pil_image is None: return None
+    
+    # 1. Convert PIL (RGB) to OpenCV (BGR)
+    image = np.array(pil_image)
+    # Check if we need to convert color space
+    if len(image.shape) == 3 and image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    elif len(image.shape) == 3 and image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+        
+    h, w = image.shape[:2]
+
+    # 2. Downscale for speed (Processing logic)
+    scale = 800 / max(h, w)
+    # Avoid upscaling if image is already small
+    if scale < 1:
+        small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        small = image
+
+    # 3. Create Binary Threshold
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+
+    # 4. Find Best Angle using Projection
+    scores = []
+    angles = np.arange(-5, 5.1, 0.5) # Steps of 0.5 are faster and usually sufficient
+
+    for angle in angles:
+        # Rotate the tiny thresholded image
+        (h_s, w_s) = thresh.shape[:2]
+        center_s = (w_s // 2, h_s // 2)
+        M_s = cv2.getRotationMatrix2D(center_s, angle, 1.0)
+        rotated = cv2.warpAffine(thresh, M_s, (w_s, h_s), flags=cv2.INTER_NEAREST)
+        
+        # Calculate score (Variance of row sums)
+        # High variance = clear lines of text (white) vs background (black)
+        score = np.var(np.sum(rotated, axis=1))
+        scores.append(score)
+
+    best_angle = angles[np.argmax(scores)]
+    print(f"      [Deskew] Best angle found: {best_angle:.2f}")
+
+    # 5. Apply to Original Image
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
+    
+    # Use BORDER_CONSTANT with White (255,255,255) to fill corners
+    corrected = cv2.warpAffine(
+        image, 
+        M, 
+        (w, h), 
+        flags=cv2.INTER_CUBIC, 
+        borderMode=cv2.BORDER_CONSTANT, 
+        borderValue=(255, 255, 255)
+    )
+    
+    # 6. Convert back to PIL (RGB)
+    return Image.fromarray(cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB))
+
     # 7. Save
     df.to_excel(excel_path, index=False)
     print(f"      -> Logged Costs. P1 Total: ${round(ip_cost_p1 + op_cost_p1, 4)}")
