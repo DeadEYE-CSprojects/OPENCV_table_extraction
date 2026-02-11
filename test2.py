@@ -166,3 +166,48 @@ if __name__ == "__main__":
         # >>> MODE B: STANDARD BATCH <<<
         print(f"\n>>> ACTIVATING BATCH MODE: Index {start} to {end} <<<")
         process_pipeline(start_index=start, end_index=end)
+
+
+
+def clean_ocr_text_gemini(raw_text):
+    """
+    Uses Gemini 2.0 Flash via 'client2' to fix OCR errors.
+    """
+    # Optimization: Skip empty or very short text
+    if not raw_text or len(raw_text) < 20:
+        return raw_text
+
+    prompt_text = (
+        "You are a post-processing OCR correction engine. "
+        "Your task is to fix the text below purely for spelling and garbage characters.\n\n"
+        "RULES:\n"
+        "1. Fix broken words (e.g., 'H os pital' -> 'Hospital').\n"
+        "2. Remove OCR artifacts (like '|', '~', '_', 'cc--').\n"
+        "3. STRICTLY PRESERVE the layout, newlines, and indentation.\n"
+        "4. DO NOT summarize. DO NOT rewrite sentences. Only fix the characters.\n"
+        "5. Return ONLY the cleaned text.\n\n"
+        "INPUT TEXT:\n"
+        f"{raw_text}"
+    )
+
+    try:
+        # !!! USE client2 HERE !!!
+        response = client2.models.generate_content(
+            model="gemini-2.0-flash", 
+            contents=[prompt_text],
+            config=types.GenerateContentConfig(
+                temperature=0.1 # Keep it strict
+            )
+        )
+        
+        # In the new SDK, response.text is the direct accessor
+        if response.text:
+            return response.text
+        else:
+            return raw_text
+
+    except Exception as e:
+        print(f"      [Warning] Gemini Cleaning Failed: {e}")
+        return raw_text
+
+
