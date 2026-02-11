@@ -1,213 +1,194 @@
-# ==========================================
-# 4. SINGLE FILE FILTERING UTILS
-# ==========================================
-
-def parse_page_ranges(range_string):
-    """
-    Parses "1-4, 49" into [0, 1, 2, 3, 48].
-    """
-    pages = set()
-    parts = range_string.split(',')
+def process_pipeline(start_index=None, end_index=None):
     
-    for part in parts:
-        part = part.strip()
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            # Adjust 1-based input to 0-based Python index
-            pages.update(range(start - 1, end)) 
-        else:
-            pages.add(int(part) - 1)
-            
-    return sorted(list(pages))
-
-def create_filtered_temp_file(target_filename, page_range_str):
-    """
-    Slices the specific file and saves it to a temp folder.
-    Returns the path to that temp folder.
-    """
-    # Define Paths
-    source_path = os.path.join(INPUT_FILES_PATH, target_filename)
-    temp_dir = "/dbfs/tmp/single_process_contract_ocr/" # Use DBFS temp path for Databricks
+    # 1. Load Inventory
+    df_inventory = get_or_create_inventory()
     
-    # Clean/Recreate Temp Directory
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir)
-    
-    if not os.path.exists(source_path):
-        print(f"ERROR: Target file '{target_filename}' not found in {INPUT_FILES_PATH}")
-        return None
+    if df_inventory.empty:
+        print("No files to process. Exiting.")
+        return
 
-    print(f"--- [Single File Mode] Filtering {target_filename} (Pages: {page_range_str}) ---")
+    # 2. Determine Processing Range
+    if start_index is None: start_index = 0
+    if end_index is None: end_index = len(df_inventory) - 1
 
-    # A. Handle File Type (DOCX -> PDF)
-    ext = os.path.splitext(target_filename)[1].lower()
-    working_pdf_path = source_path
-    
-    # Note: docx2pdf might need LibreOffice installed in Databricks environment
-    # If it fails, we assume PDF input for now.
-    if ext == '.docx':
-        print("   -> Converting DOCX to temp PDF...")
-        converted_pdf = os.path.join(temp_dir, "temp_conversion.pdf")
+    # Bounds check
+    if start_index < 0: start_index = 0
+    if end_index >= len(df_inventory): end_index = len(df_inventory) - 1
+
+    print(f"--- Pipeline Started: Processing Index {start_index} to {end_index} (High-Res Mode) ---")
+    if not RUN_CONTRACT_SCRIPT:
+        print(">>> MODE: CONVERSION ONLY (Skipping Contract Scripts) <<<")
+
+    index = start_index
+
+    # --- HELPER: MEMORY SAFE GENERATOR ---
+    def get_pdf_images_safely(pdf_path, dpi=500):
+        """Yields images 10 at a time to save RAM."""
+        import pdf2image
         try:
-            docx_to_pdf_convert(source_path, converted_pdf)
-            working_pdf_path = converted_pdf
+            info = pdf2image.pdfinfo_from_path(pdf_path)
+            max_pages = info["Pages"]
         except:
-            print("   [Warning] DOCX conversion failed. Using original file if possible.")
-
-    # B. Extract Pages using PyMuPDF (fitz)
-    try:
-        doc = fitz.open(working_pdf_path)
-        selected_pages = parse_page_ranges(page_range_str)
-        
-        new_doc = fitz.open()
-        
-        for page_idx in selected_pages:
-            if page_idx < len(doc):
-                new_doc.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
-            else:
-                print(f"   [Warning] Page {page_idx + 1} out of range. Skipping.")
-        
-        # Save the Filtered File (Keep original name for CIS ID logic)
-        final_output_path = os.path.join(temp_dir, os.path.splitext(target_filename)[0] + ".pdf")
-        new_doc.save(final_output_path)
-        new_doc.close()
-        doc.close()
-        
-        print(f"   -> Created filtered file: {final_output_path}")
-        return temp_dir
-
-    except Exception as e:
-        print(f"   [Error] Failed to slice PDF: {e}")
-        return None
-
-
-
-# ==========================================
-# EXECUTION
-# ==========================================
-if __name__ == "__main__":
-    # --- 1. DEFINE WIDGETS ---
-    try:
-        dbutils.widgets.text("start_index", "0", "Start Index")
-        dbutils.widgets.text("end_index", "100", "End Index")
-        dbutils.widgets.text("target_filename", "", "Specific File (Optional)")
-        dbutils.widgets.text("target_pages", "", "Page Range (e.g. 1-3, 50)")
-    except:
-        pass # Ignore if widgets already exist
-
-    # --- 2. GET VALUES ---
-    s_val = dbutils.widgets.get("start_index")
-    e_val = dbutils.widgets.get("end_index")
-    
-    target_file = dbutils.widgets.get("target_filename").strip()
-    target_pages = dbutils.widgets.get("target_pages").strip()
-
-    start = int(s_val) if s_val.strip() else 0
-    end = int(e_val) if e_val.strip() else None
-
-    # --- 3. DECISION LOGIC ---
-    
-    if target_file and target_pages:
-        # >>> MODE A: SINGLE FILE FILTERED <<<
-        print(f"\n>>> ACTIVATING SINGLE FILE MODE: {target_file} (Pages: {target_pages}) <<<")
-        
-        # 1. Create the specific temp input folder
-        new_input_dir = create_filtered_temp_file(target_file, target_pages)
-        
-        # 2. Define a temp output folder
-        temp_output_dir = "/dbfs/tmp/single_process_output/"
-        if os.path.exists(temp_output_dir): shutil.rmtree(temp_output_dir)
-        os.makedirs(temp_output_dir)
-        
-        if new_input_dir:
-            # Backup original global variables
-            original_input_path = INPUT_FILES_PATH
-            original_inventory_path = INVENTORY_FILE_PATH
-            original_output_path = TXT_OUTPUT_PATH  # <--- Backup Original Output Path
+            return # Handle non-PDFs or errors
             
+        for i in range(1, max_pages + 1, 10):
             try:
-                # 3. OVERRIDE Globals
-                INPUT_FILES_PATH = new_input_dir
-                INVENTORY_FILE_PATH = os.path.join(new_input_dir, "temp_inventory.xlsx")
-                TXT_OUTPUT_PATH = temp_output_dir   # <--- Override Output Path
-                
-                print(f"--- Temporary Output Path: {TXT_OUTPUT_PATH} ---")
-
-                # 4. RUN PIPELINE (Index 0)
-                process_pipeline(start_index=0, end_index=0)
-                
-                print(f"\n>>> Single File Processing Complete. <<<")
-                print(f">>> You can check results in: {temp_output_dir}")
-                
+                batch = pdf2image.convert_from_path(
+                    pdf_path, dpi=dpi, first_page=i, last_page=min(i + 9, max_pages)
+                )
+                for page in batch:
+                    yield page
             except Exception as e:
-                print(f"!!! ERROR during Single File Mode: {e}")
+                print(f"      [Error] Batch conversion failed: {e}")
+                break
+
+    # 3. Main Loop
+    while index <= end_index:
+        try:
+            row = df_inventory.iloc[index]
+            f_name = row['filename']
+            f_path = row['file_path']
+            f_ext = row['file_ext']
+            cis_id = row['CIS ID']
+            
+            clean_ext = f_ext.replace('.', '')
+            final_txt_name = f"{f_name}_{clean_ext}.txt"
+            final_txt_path = os.path.join(TXT_OUTPUT_PATH, final_txt_name)
+
+            print(f"\n[{index}] Processing: {f_name} (CIS: {cis_id})")
+
+            # --- A. SKIP CHECK ---
+            if os.path.exists(final_txt_path):
+                print(f"   -> Output found. Skipping extraction.")
+                with open(final_txt_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    txt_content = f.read()
+                goto_step_5(f_name, clean_ext, cis_id, txt_content, f_path, final_txt_path)
+                index += 1
+                continue
+
+            # --- B. FILE PROCESSING ---
+            if not os.path.exists(f_path):
+                print(f"   -> ERROR: File not found: {f_path}")
+                log_process_status(f"MISSING FILE: {f_name}")
+                index += 1
+                continue
+
+            # TYPE 1: SPREADSHEETS
+            if f_ext in ['.xlsx', '.xls', '.csv']:
+                print("   -> Type: Spreadsheet")
+                content = ""
+                if f_ext == '.csv':
+                    content = pd.read_csv(f_path).to_string()
+                else:
+                    xls = pd.ExcelFile(f_path)
+                    for sheet in xls.sheet_names:
+                        content += f"##-- SHEET: {sheet} --##\n{pd.read_excel(xls, sheet_name=sheet).to_string()}\n"
                 
-            finally:
-                # 5. CLEANUP
-                print(f"--- Cleaning up temp directories... ---")
+                with open(final_txt_path, 'w', encoding='utf-8') as f: f.write(content)
+                goto_step_5(f_name, clean_ext, cis_id, content, f_path, final_txt_path)
+
+            # TYPE 2: PLAIN TEXT
+            elif f_ext == '.txt':
+                print("   -> Type: Text File")
+                shutil.copy(f_path, final_txt_path)
+                with open(final_txt_path, 'r', encoding='utf-8') as f: content = f.read()
+                goto_step_5(f_name, clean_ext, cis_id, content, f_path, final_txt_path)
+
+            # TYPE 3: COMPLEX DOCUMENTS (PDF/DOCX/IMG)
+            elif f_ext in ['.pdf', '.docx', '.tiff', '.tif', '.jpg', '.png', '.jpeg']:
+                print("   -> Type: Complex Document (High Res)")
+                temp_pdf_path = f_path
+                is_docx = (f_ext == '.docx')
                 
-                # Delete Input Temp
-                if os.path.exists(new_input_dir):
-                    shutil.rmtree(new_input_dir)
-                    print(f"   -> Deleted Input Temp: {new_input_dir}")
+                if is_docx:
+                    print("      -> Converting DOCX to PDF...")
+                    temp_pdf_path = os.path.join(TXT_OUTPUT_PATH, f"temp_{cis_id}.pdf")
+                    docx_to_pdf_convert(f_path, temp_pdf_path)
+
+                total_extracted_text = ""
                 
-                # Delete Output Temp (Optional: Comment this out if you want to inspect results before deleting)
-                # if os.path.exists(temp_output_dir):
-                #    shutil.rmtree(temp_output_dir)
-                #    print(f"   -> Deleted Output Temp: {temp_output_dir}")
+                # --- GENERATOR LOOP START (Replaces 'images = convert...') ---
+                print("      -> Rasterizing PDF safely (Generator Mode)...")
                 
-                # Restore original paths
-                INPUT_FILES_PATH = original_input_path
-                INVENTORY_FILE_PATH = original_inventory_path
-                TXT_OUTPUT_PATH = original_output_path
-                print("--- Cleanup Complete. Restored original paths. ---")
+                # Handle single images vs PDF generator
+                if f_ext in ['.tiff', '.tif', '.jpg', '.png', '.jpeg']:
+                    # Simple single image loading
+                    img_iter = [Image.open(f_path)]
+                else:
+                    # PDF Generator
+                    img_iter = get_pdf_images_safely(temp_pdf_path, dpi=PDF_CONVERSION_DPI)
 
-    else:
-        # >>> MODE B: STANDARD BATCH <<<
-        print(f"\n>>> ACTIVATING BATCH MODE: Index {start} to {end} <<<")
-        process_pipeline(start_index=start, end_index=end)
+                for i, pil_image in enumerate(img_iter):
+                    page_num = i + 1
+                    print(f"      -> Page {page_num}...")
+                    
+                    temp_img_path = f"temp_page_{page_num}.png"
+                    pil_image.save(temp_img_path)
+                    
+                    # 1. Check Complexity
+                    is_complex, token_cost = check_page_complexity(temp_img_path)
+                    page_text = ""
+                    current_tokens = token_cost
 
+                    if is_complex:
+                        print("         -> Complex (LLM High-Res).")
+                        deskewed = deskew_image(pil_image)
+                        final_img = enhance_and_upscale(deskewed)
+                        
+                        txt_llm, t_ocr = llm_convert_to_text(final_img)
+                        page_text = txt_llm
+                        current_tokens += t_ocr
+                        log_token_usage_excel(f_name, current_tokens, 0)
+                    else:
+                        print("         -> Simple (Digital/OCR).")
+                        digital_text = ""
+                        has_digital = False
+                        
+                        target_pdf = temp_pdf_path if (is_docx or f_ext == '.pdf') else None
+                        
+                        if target_pdf and os.path.exists(target_pdf):
+                            try:
+                                with fitz.open(target_pdf) as doc:
+                                    if i < len(doc):
+                                        digital_text = doc[i].get_text()
+                                        if len(digital_text.strip()) > 15: has_digital = True
+                            except: pass
 
+                        if has_digital:
+                            page_text = digital_text
+                        else:
+                            # Fallback to Tesseract
+                            raw_ocr = pytesseract.image_to_string(pil_image)
+                            
+                            # --- NEW: GEMINI CLEANING ---
+                            print("            -> [Gemini] Cleaning OCR output...")
+                            page_text = clean_ocr_text_gemini(raw_ocr)
 
-def clean_ocr_text_gemini(raw_text):
-    """
-    Uses Gemini 2.0 Flash via 'client2' to fix OCR errors.
-    """
-    # Optimization: Skip empty or very short text
-    if not raw_text or len(raw_text) < 20:
-        return raw_text
+                    # Append
+                    formatted_page = f"\n##-- PAGE: {page_num} --##\n{page_text}\n"
+                    total_extracted_text += formatted_page
+                    
+                    with open(final_txt_path, 'a', encoding='utf-8') as f: f.write(formatted_page)
+                    
+                    if os.path.exists(temp_img_path): os.remove(temp_img_path)
+                    
+                    # Force Memory Release
+                    pil_image.close()
 
-    prompt_text = (
-        "You are a post-processing OCR correction engine. "
-        "Your task is to fix the text below purely for spelling and garbage characters.\n\n"
-        "RULES:\n"
-        "1. Fix broken words (e.g., 'H os pital' -> 'Hospital').\n"
-        "2. Remove OCR artifacts (like '|', '~', '_', 'cc--').\n"
-        "3. STRICTLY PRESERVE the layout, newlines, and indentation.\n"
-        "4. DO NOT summarize. DO NOT rewrite sentences. Only fix the characters.\n"
-        "5. Return ONLY the cleaned text.\n\n"
-        "INPUT TEXT:\n"
-        f"{raw_text}"
-    )
+                # Cleanup Temp PDF
+                if is_docx and os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
+                
+                goto_step_5(f_name, clean_ext, cis_id, total_extracted_text, f_path, final_txt_path)
 
-    try:
-        # !!! USE client2 HERE !!!
-        response = client2.models.generate_content(
-            model="gemini-2.0-flash", 
-            contents=[prompt_text],
-            config=types.GenerateContentConfig(
-                temperature=0.1 # Keep it strict
-            )
-        )
-        
-        # In the new SDK, response.text is the direct accessor
-        if response.text:
-            return response.text
-        else:
-            return raw_text
+            else:
+                print(f"   [Skipped] Unknown file type: {f_ext}")
+                log_process_status(f"SKIPPED: {f_name}")
 
-    except Exception as e:
-        print(f"      [Warning] Gemini Cleaning Failed: {e}")
-        return raw_text
+            index += 1
 
-
+        except Exception as e:
+            print(f"!!! ERROR on Index {index}: {e}")
+            log_process_status(f"ERROR: Index {index} - {str(e)}")
+            index += 1
+            time.sleep(1)
+            continue
