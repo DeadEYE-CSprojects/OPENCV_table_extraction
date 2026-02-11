@@ -1,111 +1,168 @@
 # ==========================================
-# REPLACEMENT FUNCTIONS
+# 4. SINGLE FILE FILTERING UTILS
 # ==========================================
 
-def determine_contract_type(text_content):
+def parse_page_ranges(range_string):
     """
-    Scans text for specific medical keywords to identify the contract type.
-    Priority:
-    1. If MULTIPLE types are detected -> Returns 'Others'
-    2. If ONE type is detected -> Returns that type
-    3. If NO types are detected -> Returns 'Others'
+    Parses "1-4, 49" into [0, 1, 2, 3, 48].
     """
+    pages = set()
+    parts = range_string.split(',')
     
-    # Normalize text for matching
-    text_upper = text_content.upper()
-    
-    # Define Regex Patterns for your 22 types
-    # I have generated reasonable keywords. You can update these lists later.
-    patterns = {
-        "home_health": [r"HOME\s+HEALTH", r"HOME\s+CARE\s+AGENCY", r"\bHHA\b"],
-        "skilled_nursing": [r"SKILLED\s+NURSING", r"\bSNF\b", r"NURSING\s+FACILITY"],
-        "aec": [r"AMBULATORY\s+EMERGENCY", r"\bAEC\b", r"FREESTANDING\s+EMERGENCY"],
-        "asc": [r"AMBULATORY\s+SURGERY", r"\bASC\b", r"SURGICAL\s+CENTER"],
-        "detox": [r"DETOXIFICATION", r"\bDETOX\b", r"SUBSTANCE\s+ABUSE\s+TREATMENT"],
-        "dialysis": [r"DIALYSIS", r"RENAL\s+DISEASE", r"\bESRD\b", r"KIDNEY\s+CENTER"],
-        "hca": [r"HCA\s+HEALTHCARE", r"HOSPITAL\s+CORPORATION\s+OF\s+AMERICA"], # Assuming HCA Health System
-        "hospice": [r"HOSPICE", r"PALLIATIVE\s+CARE", r"END\s+OF\s+LIFE"],
-        "psych": [r"PSYCHIATRIC", r"MENTAL\s+HEALTH", r"BEHAVIORAL\s+HEALTH", r"\bIPF\b"],
-        "rehab": [r"REHABILITATION", r"PHYSICAL\s+THERAPY", r"OCCUPATIONAL\s+THERAPY"],
-        "tenet": [r"TENET\s+HEALTH", r"TENET\s+HOSPITAL"],
-        "prosthetics": [r"PROSTHETICS", r"ORTHOTICS", r"\bP&O\b", r"DMEPOS"],
-        "drg": [r"DIAGNOSIS\s+RELATED\s+GROUP", r"DRG\s+REIMBURSEMENT", r"MS-DRG"],
-        "cah": [r"CRITICAL\s+ACCESS", r"\bCAH\b"],
-        "rhc": [r"RURAL\s+HEALTH\s+CLINIC", r"\bRHC\b"],
-        "dme": [r"DURABLE\s+MEDICAL\s+EQUIPMENT", r"\bDME\b", r"MEDICAL\s+SUPPLY"],
-        "anesthesia": [r"ANESTHESIA", r"ANESTHESIOLOGY", r"CRNA"],
-        "chv": [r"CARDIOLOGY", r"HEART\s+AND\s+VASCULAR", r"\bCHV\b"],
-        "surgery": [r"GENERAL\s+SURGERY", r"SURGEON", r"OPERATIVE\s+SERVICES"], # General surgery (non-ASC)
-        "telemedicine": [r"TELEMEDICINE", r"TELEHEALTH", r"REMOTE\s+PATIENT"],
-        "audiology": [r"AUDIOLOGY", r"HEARING\s+AID", r"HEARING\s+TEST"]
-    }
+    for part in parts:
+        part = part.strip()
+        if '-' in part:
+            start, end = map(int, part.split('-'))
+            # Adjust 1-based input to 0-based Python index
+            pages.update(range(start - 1, end)) 
+        else:
+            pages.add(int(part) - 1)
+            
+    return sorted(list(pages))
 
-    detected_types = []
-
-    # Scan for each type
-    print("      -> [Classifier] Scanning for contract keywords...")
-    for c_type, regex_list in patterns.items():
-        for pattern in regex_list:
-            if re.search(pattern, text_upper):
-                if c_type not in detected_types:
-                    detected_types.append(c_type)
-                break # Move to next type once found
-
-    # Logic for Classification
-    if len(detected_types) > 1:
-        print(f"      -> [Classifier] Multiple types found: {detected_types}. Defaulting to 'Others'.")
-        return "Others"
-    elif len(detected_types) == 1:
-        return detected_types[0]
-    else:
-        print("      -> [Classifier] No specific keywords found. Defaulting to 'Others'.")
-        return "Others"
-
-def goto_step_5(filename, filetype, cis_id, text_content, original_path, txt_path):
+def create_filtered_temp_file(target_filename, page_range_str):
     """
-    Step 5: Finalize.
-    Identifies the contract type using REGEX and runs the specific Python script.
+    Slices the specific file and saves it to a temp folder.
+    Returns the path to that temp folder.
     """
-    if not RUN_CONTRACT_SCRIPT:
-        print(f"   -> Conversion Complete. Saved to: {os.path.basename(txt_path)}")
-        log_process_status(f"CONVERTED ONLY: {filename}")
-        return
+    # Define Paths
+    source_path = os.path.join(INPUT_FILES_PATH, target_filename)
+    temp_dir = "/dbfs/tmp/single_process_contract_ocr/" # Use DBFS temp path for Databricks
     
-    print("   -> Step 5: Contract Analysis (Regex Mode)")
+    # Clean/Recreate Temp Directory
+    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
     
-    # 1. Identify Type using Regex/Keywords (No LLM)
-    ctype = determine_contract_type(text_content)
-    print(f"      -> Final Classification: {ctype}")
+    if not os.path.exists(source_path):
+        print(f"ERROR: Target file '{target_filename}' not found in {INPUT_FILES_PATH}")
+        return None
+
+    print(f"--- [Single File Mode] Filtering {target_filename} (Pages: {page_range_str}) ---")
+
+    # A. Handle File Type (DOCX -> PDF)
+    ext = os.path.splitext(target_filename)[1].lower()
+    working_pdf_path = source_path
     
-    # 2. Locate the specific script
-    # Standardize casing: home_health -> home_health.py, Others -> others.py
-    target_script = f"{ctype.lower()}.py"
-    script_full_path = os.path.join(CONTRACT_SCRIPTS_PATH, target_script)
-    
-    # 3. Fallback logic
-    # If the specific script (e.g., 'home_health.py') doesn't exist, use 'others.py'
-    # BUT pass the detected type as an argument so 'others.py' knows what it is.
-    if not os.path.exists(script_full_path):
-        print(f"      [Info] Script '{target_script}' not found. Falling back to 'others.py'.")
-        script_full_path = os.path.join(CONTRACT_SCRIPTS_PATH, "others.py")
-    
-    # 4. Execute Script
-    if os.path.exists(script_full_path):
+    # Note: docx2pdf might need LibreOffice installed in Databricks environment
+    # If it fails, we assume PDF input for now.
+    if ext == '.docx':
+        print("   -> Converting DOCX to temp PDF...")
+        converted_pdf = os.path.join(temp_dir, "temp_conversion.pdf")
         try:
-            print(f"      -> Executing: {script_full_path}")
-            subprocess.run([
-                "python", script_full_path,
-                "--filename", str(filename), 
-                "--filetype", str(filetype), 
-                "--cis_id", str(cis_id),
-                "--contract_type", str(ctype),  # Pass the detected type (e.g., 'home_health')
-                "--file_path", str(original_path), 
-                "--txt_path", str(txt_path)
-            ], check=True)
-            log_process_status(f"SUCCESS: {filename} processed as {ctype}")
-        except subprocess.CalledProcessError as e:
-            print(f"      [Error] Subprocess Failed: {e}")
-            log_process_status(f"ERROR: Script execution failed for {filename}")
+            docx_to_pdf_convert(source_path, converted_pdf)
+            working_pdf_path = converted_pdf
+        except:
+            print("   [Warning] DOCX conversion failed. Using original file if possible.")
+
+    # B. Extract Pages using PyMuPDF (fitz)
+    try:
+        doc = fitz.open(working_pdf_path)
+        selected_pages = parse_page_ranges(page_range_str)
+        
+        new_doc = fitz.open()
+        
+        for page_idx in selected_pages:
+            if page_idx < len(doc):
+                new_doc.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
+            else:
+                print(f"   [Warning] Page {page_idx + 1} out of range. Skipping.")
+        
+        # Save the Filtered File (Keep original name for CIS ID logic)
+        final_output_path = os.path.join(temp_dir, os.path.splitext(target_filename)[0] + ".pdf")
+        new_doc.save(final_output_path)
+        new_doc.close()
+        doc.close()
+        
+        print(f"   -> Created filtered file: {final_output_path}")
+        return temp_dir
+
+    except Exception as e:
+        print(f"   [Error] Failed to slice PDF: {e}")
+        return None
+
+
+
+# ==========================================
+# EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    # --- 1. DEFINE WIDGETS ---
+    try:
+        dbutils.widgets.text("start_index", "0", "Start Index")
+        dbutils.widgets.text("end_index", "100", "End Index")
+        dbutils.widgets.text("target_filename", "", "Specific File (Optional)")
+        dbutils.widgets.text("target_pages", "", "Page Range (e.g. 1-3, 50)")
+    except:
+        pass # Ignore if widgets already exist
+
+    # --- 2. GET VALUES ---
+    s_val = dbutils.widgets.get("start_index")
+    e_val = dbutils.widgets.get("end_index")
+    
+    target_file = dbutils.widgets.get("target_filename").strip()
+    target_pages = dbutils.widgets.get("target_pages").strip()
+
+    start = int(s_val) if s_val.strip() else 0
+    end = int(e_val) if e_val.strip() else None
+
+    # --- 3. DECISION LOGIC ---
+    
+    if target_file and target_pages:
+        # >>> MODE A: SINGLE FILE FILTERED <<<
+        print(f"\n>>> ACTIVATING SINGLE FILE MODE: {target_file} (Pages: {target_pages}) <<<")
+        
+        # 1. Create the specific temp input folder
+        new_input_dir = create_filtered_temp_file(target_file, target_pages)
+        
+        # 2. Define a temp output folder
+        temp_output_dir = "/dbfs/tmp/single_process_output/"
+        if os.path.exists(temp_output_dir): shutil.rmtree(temp_output_dir)
+        os.makedirs(temp_output_dir)
+        
+        if new_input_dir:
+            # Backup original global variables
+            original_input_path = INPUT_FILES_PATH
+            original_inventory_path = INVENTORY_FILE_PATH
+            original_output_path = TXT_OUTPUT_PATH  # <--- Backup Original Output Path
+            
+            try:
+                # 3. OVERRIDE Globals
+                INPUT_FILES_PATH = new_input_dir
+                INVENTORY_FILE_PATH = os.path.join(new_input_dir, "temp_inventory.xlsx")
+                TXT_OUTPUT_PATH = temp_output_dir   # <--- Override Output Path
+                
+                print(f"--- Temporary Output Path: {TXT_OUTPUT_PATH} ---")
+
+                # 4. RUN PIPELINE (Index 0)
+                process_pipeline(start_index=0, end_index=0)
+                
+                print(f"\n>>> Single File Processing Complete. <<<")
+                print(f">>> You can check results in: {temp_output_dir}")
+                
+            except Exception as e:
+                print(f"!!! ERROR during Single File Mode: {e}")
+                
+            finally:
+                # 5. CLEANUP
+                print(f"--- Cleaning up temp directories... ---")
+                
+                # Delete Input Temp
+                if os.path.exists(new_input_dir):
+                    shutil.rmtree(new_input_dir)
+                    print(f"   -> Deleted Input Temp: {new_input_dir}")
+                
+                # Delete Output Temp (Optional: Comment this out if you want to inspect results before deleting)
+                # if os.path.exists(temp_output_dir):
+                #    shutil.rmtree(temp_output_dir)
+                #    print(f"   -> Deleted Output Temp: {temp_output_dir}")
+                
+                # Restore original paths
+                INPUT_FILES_PATH = original_input_path
+                INVENTORY_FILE_PATH = original_inventory_path
+                TXT_OUTPUT_PATH = original_output_path
+                print("--- Cleanup Complete. Restored original paths. ---")
+
     else:
-        print(f"      [Error] CRITICAL: 'others.py' is missing in {CONTRACT_SCRIPTS_PATH}.")
-        log_process_status(f"ERROR: Missing others.py for {filename}")
+        # >>> MODE B: STANDARD BATCH <<<
+        print(f"\n>>> ACTIVATING BATCH MODE: Index {start} to {end} <<<")
+        process_pipeline(start_index=start, end_index=end)
