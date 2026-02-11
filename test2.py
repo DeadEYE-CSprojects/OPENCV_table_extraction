@@ -1,6 +1,7 @@
 def process_pipeline(start_index=None, end_index=None):
     
     # 1. Load Inventory
+    
     df_inventory = get_or_create_inventory()
     
     if df_inventory.empty:
